@@ -1,10 +1,10 @@
-# Latent Diffusion Model from Scratch in JAX/Flax
+# Latent Diffusion Model from Scratch in PyTorch
 
-**Goal:** Build a text-to-image Latent Diffusion Model trained on `lambdalabs/pokemon-blip-captions`. Everything from diffusion math to U-Net to training loop is implemented by hand in JAX/Flax. This is a learning project — we implement together, step by step.
+**Goal:** Build a text-to-image Latent Diffusion Model trained on `lambdalabs/pokemon-blip-captions`. Everything from diffusion math to U-Net to training loop is implemented by hand in PyTorch. This is a learning project — we implement together, step by step.
 
 **Environment:** Google Colab (single GPU, limited VRAM)
 
-**Key Constraint:** We do NOT train the VAE or Text Encoder. We pre-compute latents and text embeddings using HuggingFace (PyTorch), save them as NumPy arrays, then work purely in JAX/Flax for everything else.
+**Key Constraint:** We do NOT train the VAE or Text Encoder. We pre-compute latents and text embeddings using HuggingFace, save them as tensors, then train only the U-Net.
 
 ---
 
@@ -50,110 +50,112 @@ We don't diffuse in pixel space (too expensive). Instead we use a pre-trained VA
 ## Step 1: Dependencies & Setup
 
 **Libraries:**
-- `jax`, `jaxlib` (GPU-enabled)
-- `flax` (neural network library)
-- `optax` (optimizers)
-- `diffusers`, `transformers` (for pre-computing latents/embeddings)
+- `torch`, `torchvision` (CUDA-enabled)
+- `diffusers`, `transformers` (for VAE and CLIP)
 - `datasets` (HuggingFace datasets)
+- `accelerate` (optional, for cleaner device handling)
 - `numpy`, `tqdm`, `matplotlib`
 
 **Colab setup:**
-- Verify GPU with `jax.devices()`
+- Verify GPU with `torch.cuda.is_available()` and `torch.cuda.get_device_name(0)`
 - Mount Google Drive for saving checkpoints and pre-computed data
+- Set seeds (`torch.manual_seed`, `numpy.random.seed`) for reproducibility
 
 ---
 
-## Step 2: Data Pre-computation Pipeline (PyTorch → NumPy)
+## Step 2: Data Pre-computation Pipeline (run once)
 
-This is a one-off script. Run it once, save results to Drive, never run again.
+This is a one-off script. Run it once, save results to Drive, never run again. Frees the VAE and text encoder from VRAM during training.
 
 1. **Load pre-trained models:**
-   - VAE from `CompVis/stable-diffusion-v1-4`
-   - CLIP text encoder from `openai/clip-vit-large-patch14`
-   - Both in `eval()` mode, gradients disabled
+   - VAE from `stabilityai/sd-vae-ft-mse` (no gated access, no HF login required)
+   - CLIP text encoder + tokenizer from `openai/clip-vit-large-patch14`
+   - Both in `eval()` mode, gradients disabled, moved to GPU
 
 2. **Process images → latents:**
    - Resize to 512×512, normalize to [-1, 1]
-   - Encode through VAE encoder
+   - Encode through `vae.encode(x).latent_dist.sample()`
    - Scale latents by `0.18215` (Stable Diffusion convention)
-   - Permute from PyTorch NCHW `(B, 4, 64, 64)` → JAX NHWC `(B, 64, 64, 4)`
+   - Keep PyTorch's NCHW: `(N, 4, 64, 64)`
 
 3. **Process captions → embeddings:**
-   - Tokenize with CLIP tokenizer (max_length=77, padding, truncation)
-   - Encode through CLIP text encoder
-   - Output shape: `(B, 77, 768)`
+   - Tokenize with CLIP tokenizer (`max_length=77`, `padding="max_length"`, `truncation=True`)
+   - Encode through CLIP text encoder, take `last_hidden_state`
+   - Output shape: `(N, 77, 768)`
 
 4. **Compute unconditional embedding:**
    - Encode empty string `""` through CLIP
    - Save separately — needed for CFG during training and inference
 
 5. **Save to disk:**
-   - `latents.npy` — shape `(N, 64, 64, 4)` where N ≈ 833
-   - `embeddings.npy` — shape `(N, 77, 768)`
-   - `uncond_embedding.npy` — shape `(1, 77, 768)`
+   - `latents.pt` — shape `(N, 4, 64, 64)` where N ≈ 833
+   - `embeddings.pt` — shape `(N, 77, 768)`
+   - `uncond_embedding.pt` — shape `(1, 77, 768)`
+   - Use `torch.save(tensor.cpu(), path)`
 
 ---
 
-## Step 3: Diffusion Core (Pure JAX)
+## Step 3: Diffusion Core
 
-Implement as pure functions (no classes needed):
+Implement as a small `NoiseScheduler` class or a set of pure functions:
 
 - **Timesteps:** $T = 1000$
 - **Beta schedule:** Linear from $\beta_1 = 0.00085$ to $\beta_T = 0.012$
-- **Pre-compute:** `betas`, `alphas`, `alphas_cumprod`, `sqrt_alphas_cumprod`, `sqrt_one_minus_alphas_cumprod`
-- **Forward noising function:** `q_sample(x_0, t, noise, noise_schedule)` → returns $x_t$
-- **All arrays as JAX arrays**, indexed by timestep `t`
+- **Pre-compute and register as buffers:** `betas`, `alphas`, `alphas_cumprod`, `sqrt_alphas_cumprod`, `sqrt_one_minus_alphas_cumprod`
+- **Forward noising function:** `q_sample(x_0, t, noise)` → returns $x_t`
+- **All tensors live on the same device as the model** (use `.to(device)` or register as buffers)
+- Index per-sample with `tensor[t].view(-1, 1, 1, 1)` so it broadcasts over `(B, C, H, W)`
 
 ---
 
-## Step 4: Flax U-Net Architecture
+## Step 4: PyTorch U-Net Architecture
 
-The U-Net predicts noise $\epsilon_\theta(x_t, t, c)$. Built entirely in `flax.linen`.
+The U-Net predicts noise $\epsilon_\theta(x_t, t, c)$. Built entirely with `torch.nn` modules.
 
 ### Sub-modules to implement:
 
 **TimeEmbedding:**
 - Sinusoidal positional encoding of timestep $t$ → vector
-- 2-layer MLP: Linear → SiLU → Linear
-- Output injected into each ResNet block
+- 2-layer MLP: `nn.Linear → nn.SiLU → nn.Linear`
+- Output projected and added inside each ResNet block
 
 **ResNetBlock:**
-- GroupNorm → SiLU → Conv3×3 → GroupNorm → SiLU → Conv3×3
-- Time embedding added between the two conv layers (project + add)
+- `GroupNorm → SiLU → Conv3×3 → (add projected t_emb) → GroupNorm → SiLU → Dropout → Conv3×3`
 - Skip connection (with 1×1 conv if channels change)
 
-**AttentionBlock (Cross-Attention):**
+**AttentionBlock (Self + Cross):**
 - Self-Attention: Q=K=V from image features (spatial self-attention)
 - Cross-Attention: Q from image features, K/V from text embeddings `(B, 77, 768)`
 - Multi-head attention: 4 heads at 128-dim, 8 heads at 256-dim
-- Pre-norm with GroupNorm/LayerNorm
+- Pre-norm with `GroupNorm` for spatial, `LayerNorm` for sequence dim
+- Use `torch.nn.functional.scaled_dot_product_attention` (fast + memory-efficient)
 
-**Downsample:** Conv with stride 2 (not pooling)
-**Upsample:** Nearest-neighbor interpolation + Conv
+**Downsample:** `nn.Conv2d(c, c, 3, stride=2, padding=1)` (not pooling)
+**Upsample:** `F.interpolate(scale_factor=2, mode="nearest")` + Conv3×3
 
-### Architecture:
+### Architecture (NCHW throughout):
 
 ```
-Input: (B, 64, 64, 4)
+Input: (B, 4, 64, 64)
 │
 ├─ Conv3×3 → (B, 64, 64, 64)
 │
-├─ DownBlock1: 2×(ResNet + SelfAttn + CrossAttn) → (B, 64, 64, 64) → Downsample → (B, 32, 32, 64)
-├─ DownBlock2: 2×(ResNet + SelfAttn + CrossAttn) → (B, 32, 32, 128) → Downsample → (B, 16, 16, 128)
-├─ DownBlock3: 2×(ResNet + SelfAttn + CrossAttn) → (B, 16, 16, 256) → Downsample → (B, 8, 8, 256)
+├─ DownBlock1: 2×(ResNet + SelfAttn + CrossAttn) → (B, 64, 64, 64) → Downsample → (B, 64, 32, 32)
+├─ DownBlock2: 2×(ResNet + SelfAttn + CrossAttn) → (B, 128, 32, 32) → Downsample → (B, 128, 16, 16)
+├─ DownBlock3: 2×(ResNet + SelfAttn + CrossAttn) → (B, 256, 16, 16) → Downsample → (B, 256, 8, 8)
 │
-├─ MidBlock: ResNet + SelfAttn + CrossAttn + ResNet → (B, 8, 8, 256)
+├─ MidBlock: ResNet + SelfAttn + CrossAttn + ResNet → (B, 256, 8, 8)
 │
-├─ UpBlock3: 2×(ResNet + SelfAttn + CrossAttn) → (B, 8, 8, 256) → Upsample → (B, 16, 16, 256)
-├─ UpBlock2: 2×(ResNet + SelfAttn + CrossAttn) → (B, 16, 16, 128) → Upsample → (B, 32, 32, 128)
-├─ UpBlock1: 2×(ResNet + SelfAttn + CrossAttn) → (B, 32, 32, 64) → Upsample → (B, 64, 64, 64)
+├─ UpBlock3: 2×(ResNet + SelfAttn + CrossAttn) → (B, 256, 8, 8) → Upsample → (B, 256, 16, 16)
+├─ UpBlock2: 2×(ResNet + SelfAttn + CrossAttn) → (B, 128, 16, 16) → Upsample → (B, 128, 32, 32)
+├─ UpBlock1: 2×(ResNet + SelfAttn + CrossAttn) → (B, 64, 32, 32) → Upsample → (B, 64, 64, 64)
 │
-├─ GroupNorm → SiLU → Conv3×3 → (B, 64, 64, 4)
+├─ GroupNorm → SiLU → Conv3×3 → (B, 4, 64, 64)
 │
-Output: predicted noise (B, 64, 64, 4)
+Output: predicted noise (B, 4, 64, 64)
 ```
 
-**Skip connections:** Concatenate encoder features with decoder features (double channels at each UpBlock input, handled by first ResNet block).
+**Skip connections:** Concatenate encoder features with decoder features along the channel dim (`torch.cat(dim=1)`). The first ResNet of each UpBlock takes `2*C` channels in.
 
 **Channel dims kept small** (64/128/256) to fit in Colab VRAM.
 
@@ -164,36 +166,39 @@ Output: predicted noise (B, 64, 64, 4)
 ### Hyperparameters:
 - **Batch size:** 4 (maybe 8 if memory allows)
 - **Learning rate:** 1e-4
-- **LR schedule:** Linear warmup (1000 steps) → cosine decay
-- **Optimizer:** AdamW (optax)
+- **LR schedule:** Linear warmup (1000 steps) → cosine decay (use `torch.optim.lr_scheduler.LambdaLR` or `transformers.get_cosine_schedule_with_warmup`)
+- **Optimizer:** `torch.optim.AdamW`
 - **Epochs:** 200-300 (833 samples is small, needs many passes)
 - **CFG dropout:** p=0.1 (replace text embedding with uncond embedding)
+- **Grad clipping:** `torch.nn.utils.clip_grad_norm_` at 1.0
 
 ### EMA (Exponential Moving Average):
-- Keep a shadow copy of model weights: `ema_params = 0.9999 * ema_params + 0.0001 * params`
-- Update every training step
-- Use EMA params for inference (produces smoother, higher-quality samples)
+- Maintain a shadow model: same architecture, no gradients
+- Update every step: `ema_param.mul_(0.9999).add_(param.data, alpha=0.0001)`
+- Or use `torch.optim.swa_utils.AveragedModel` with custom `avg_fn`
+- Use EMA model for inference (smoother, higher-quality samples)
 
-### Training step (JIT-compiled):
-1. Sample random timesteps $t$ for each item in batch
-2. Sample random noise $\epsilon$
-3. Compute $x_t$ using forward process
-4. CFG dropout: with probability 0.1, swap text embeddings for uncond embedding
-5. Predict noise: $\hat{\epsilon} = \text{UNet}(x_t, t, c)$
-6. Loss = MSE($\epsilon$, $\hat{\epsilon}$)
-7. Backprop, update params, update EMA
+### Training step:
+1. Sample random timesteps $t \sim \text{Uniform}(0, T)$ per batch item
+2. Sample random noise $\epsilon \sim \mathcal{N}(0, I)$
+3. Compute $x_t$ via `q_sample`
+4. CFG dropout: with probability 0.1, swap each row's text embedding for uncond embedding
+5. Forward pass: $\hat{\epsilon} = \text{UNet}(x_t, t, c)$
+6. Loss = `F.mse_loss(eps_pred, eps)`
+7. `loss.backward()`, clip grads, `optimizer.step()`, `optimizer.zero_grad()`
+8. `scheduler.step()`, update EMA
 
-### PRNG key management:
-- Split keys properly at every step (noise key, dropout key, CFG key)
-- Pass new keys into `train_step` — never reuse
+### Performance:
+- Wrap the model with `torch.compile(model)` after init for ~20-30% speedup
+- Use `torch.set_float32_matmul_precision("high")` to enable TF32 on Ampere+
 
 ### Monitoring:
-- Log loss every N steps
-- Generate a sample image every 10-20 epochs (using EMA params)
+- Log loss every N steps (running average is more useful than instantaneous)
+- Generate a sample image every 10-20 epochs (using EMA model)
 - Plot loss curve
 
 ### Checkpointing:
-- Save model params + EMA params + optimizer state every 25 epochs
+- Save `{model_state, ema_state, optimizer_state, scheduler_state, step, epoch}` every 25 epochs
 - Save to Google Drive (Colab sessions die)
 - Implement resume-from-checkpoint
 
@@ -203,14 +208,14 @@ Output: predicted noise (B, 64, 64, 4)
 
 The slow but faithful sampler (1000 steps):
 
-1. Start with pure noise $x_T \sim \mathcal{N}(0, I)$, shape `(1, 64, 64, 4)`
-2. For $t = T, T-1, ..., 1$:
+1. Start with pure noise $x_T \sim \mathcal{N}(0, I)$, shape `(1, 4, 64, 64)`
+2. For $t = T-1, T-2, ..., 0$:
    - Predict noise with conditioning: $\epsilon_{cond} = \text{UNet}(x_t, t, c_{text})$
    - Predict noise without conditioning: $\epsilon_{uncond} = \text{UNet}(x_t, t, c_{empty})$
    - CFG combine: $\epsilon = \epsilon_{uncond} + 7.5 \cdot (\epsilon_{cond} - \epsilon_{uncond})$
    - Compute $x_{t-1}$ using DDPM update equations
-3. Scale final latent: divide by `0.18215`
-4. Permute back to NCHW: `(1, 64, 64, 4)` → `(1, 4, 64, 64)`
+3. Wrap the loop in `torch.no_grad()` and run model in `eval()` mode
+4. Scale final latent: divide by `0.18215`
 5. Decode through VAE decoder → RGB image
 6. Display with matplotlib
 
@@ -221,18 +226,19 @@ The slow but faithful sampler (1000 steps):
 Same model, faster sampling (50 steps instead of 1000):
 
 - Select a subset of timesteps (e.g., 50 evenly spaced from 1000)
-- DDIM update is deterministic (no added noise between steps)
+- DDIM update is deterministic (no added noise between steps when `eta=0`)
 - Same CFG logic as DDPM
 - Much faster iteration during development
 
 ---
 
-## Step 8: bfloat16 Mixed Precision
+## Step 8: Mixed Precision
 
 After everything works in float32:
-- Convert model params to bfloat16
-- Keep optimizer state in float32 (prevents underflow)
-- Significantly reduces VRAM usage — might allow larger batch size
+- Use `torch.autocast(device_type="cuda", dtype=torch.bfloat16)` around the forward+loss
+- Keep params and optimizer state in float32 (autocast handles the rest)
+- Or for more aggressive savings: cast model directly to `bfloat16` (no GradScaler needed since bf16 has fp32's exponent range)
+- Significantly reduces VRAM — might allow larger batch size
 
 ---
 
@@ -249,10 +255,11 @@ After everything works in float32:
 6. Step 8 (optimization) — only if needed for memory
 
 **When things go wrong:**
-- OOM → reduce batch size, reduce channels, try bfloat16
-- Loss not decreasing → check learning rate, check noise schedule, verify tensor shapes
-- Generated images are noise → train longer, check CFG implementation
-- Generated images are blurry → increase guidance scale, check EMA decay
+- OOM → reduce batch size, reduce channels, try bfloat16, enable `torch.utils.checkpoint` on ResNet blocks
+- Loss not decreasing → check learning rate, check noise schedule, verify tensor shapes, check that grads aren't getting zeroed by `.detach()` somewhere
+- Loss is NaN → grad clipping, lower LR, check for division by zero in attention scaling
+- Generated images are noise → train longer, check CFG implementation, verify EMA is loaded for inference
+- Generated images are blurry → increase guidance scale, check EMA decay (0.9999 is right; 0.99 is too aggressive)
 
 **Dataset info:**
 - `lambdalabs/pokemon-blip-captions`: ~833 Pokemon images with text captions
