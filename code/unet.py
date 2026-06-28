@@ -139,9 +139,9 @@ class SelfAttention(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
         out = F.scaled_dot_product_attention(q, k, v)
 
-        out = out.transpose(1, 2).contiguous().view(B, H * W, C)
+        out = out.transpose(1, 2).reshape(B, H * W, C)
         out = self.proj_out(out)
-        out = out.transpose(1, 2).view(B, C, H, W)
+        out = out.transpose(1, 2).reshape(B, C, H, W)
 
         return out + residual
 
@@ -185,9 +185,9 @@ class CrossAttention(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
         out = F.scaled_dot_product_attention(q, k, v)
 
-        out = out.transpose(1, 2).contiguous().view(B, H * W, C)
+        out = out.transpose(1, 2).reshape(B, H * W, C)
         out = self.proj_out(out)
-        out = out.transpose(1, 2).view(B, C, H, W)
+        out = out.transpose(1, 2).reshape(B, C, H, W)
 
         return out + residual
 

@@ -123,6 +123,7 @@ def train_step(
     cfg_dropout_prob: float = 0.1,
     grad_clip: float = 1.0,
     ema_decay: float = 0.9999,
+    amp_dtype: torch.dtype | None = None,
 ) -> float:
     """
     One optimizer step. Returns the scalar loss.
@@ -131,6 +132,8 @@ def train_step(
         x_0              : (B, 4, 64, 64)   clean latents
         context          : (B, 77, 768)     text embeddings
         uncond_embedding : (1, 77, 768)     empty-string embedding (for CFG dropout)
+        amp_dtype        : if torch.bfloat16, wraps forward+loss in autocast.
+                           Params stay fp32; no GradScaler needed for bf16.
     """
     model.train()
     B = x_0.shape[0]
@@ -150,8 +153,13 @@ def train_step(
     context = apply_cfg_dropout(context, uncond_embedding, cfg_dropout_prob)
 
     # 5. Predict noise. MSE against the actual noise.
-    eps_pred = model(x_t, t, context)
-    loss = F.mse_loss(eps_pred, noise)
+    if amp_dtype is not None:
+        with torch.autocast(device_type=device.type, dtype=amp_dtype):
+            eps_pred = model(x_t, t, context)
+            loss = F.mse_loss(eps_pred, noise)
+    else:
+        eps_pred = model(x_t, t, context)
+        loss = F.mse_loss(eps_pred, noise)
 
     # 6. Backward + optimizer step. Grad clip prevents the occasional spike
     #    from blowing up training (mostly an issue early on with random init).
