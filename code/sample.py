@@ -16,10 +16,7 @@ import torch
 import torch.nn as nn
 
 
-# ---------------------------------------------------------------------------
 # CFG helper
-# ---------------------------------------------------------------------------
-
 def _predict_eps_with_cfg(
     model: nn.Module,
     x_t: torch.Tensor,
@@ -49,10 +46,7 @@ def _predict_eps_with_cfg(
     return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
 
-# ---------------------------------------------------------------------------
 # DDPM sampler (slow, 1000 steps)
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def sample_ddpm(
     model: nn.Module,
@@ -120,10 +114,7 @@ def sample_ddpm(
     return x
 
 
-# ---------------------------------------------------------------------------
 # DDIM sampler (fast, deterministic)
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def sample_ddim(
     model: nn.Module,
@@ -189,10 +180,7 @@ def sample_ddim(
     return x
 
 
-# ---------------------------------------------------------------------------
 # Decode helpers (require a VAE)
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def latents_to_images(latents: torch.Tensor, vae, scale: float = 0.18215) -> torch.Tensor:
     """

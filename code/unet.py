@@ -21,11 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
 # Time embedding
-# ---------------------------------------------------------------------------
-
-def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+def _sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     """
     Transformer-style positional encoding adapted for timesteps.
     Input  t : shape (B,), integer
@@ -53,13 +50,10 @@ class TimeEmbedding(nn.Module):
         )
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return self.mlp(sinusoidal_embedding(t, self.dim))
+        return self.mlp(_sinusoidal_embedding(t, self.dim))
 
 
-# ---------------------------------------------------------------------------
 # ResNet block (with time conditioning)
-# ---------------------------------------------------------------------------
-
 class ResNetBlock(nn.Module):
     """
     GroupNorm -> SiLU -> Conv -> (add time) -> GroupNorm -> SiLU -> Dropout -> Conv -> + skip
@@ -101,10 +95,7 @@ class ResNetBlock(nn.Module):
         return h + residual
 
 
-# ---------------------------------------------------------------------------
 # Attention
-# ---------------------------------------------------------------------------
-
 class SelfAttention(nn.Module):
     """
     Each spatial position attends to every other spatial position.
@@ -192,10 +183,7 @@ class CrossAttention(nn.Module):
         return out + residual
 
 
-# ---------------------------------------------------------------------------
 # Resampling
-# ---------------------------------------------------------------------------
-
 class Downsample(nn.Module):
     """Strided 3x3 conv. Learned downsample is better than MaxPool."""
 
@@ -219,10 +207,7 @@ class Upsample(nn.Module):
         return self.conv(x)
 
 
-# ---------------------------------------------------------------------------
 # Stages
-# ---------------------------------------------------------------------------
-
 class DownStage(nn.Module):
     """ResNet -> SelfAttn -> CrossAttn. Channel change happens in the ResNet."""
 
@@ -255,10 +240,7 @@ class UpStage(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------------
 # Full U-Net
-# ---------------------------------------------------------------------------
-
 class UNet(nn.Module):
     """
     Latent diffusion U-Net.
@@ -296,7 +278,7 @@ class UNet(nn.Module):
         self.down3 = DownStage(c2, c3, t_emb_dim, context_dim)
         self.down3_sample = Downsample(c3)
 
-        # Bottleneck.
+        # Bottleneck
         self.mid_res1 = ResNetBlock(c3, c3, t_emb_dim)
         self.mid_self_attn = SelfAttention(c3)
         self.mid_cross_attn = CrossAttention(c3, context_dim=context_dim)

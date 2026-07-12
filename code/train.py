@@ -18,10 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
 # EMA (Exponential Moving Average)
-# ---------------------------------------------------------------------------
-
 def build_ema(model: nn.Module) -> nn.Module:
     """
     Create a deep-copied shadow of the model with grads disabled.
@@ -54,10 +51,7 @@ def ema_update(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999) ->
         ema_b.copy_(b)
 
 
-# ---------------------------------------------------------------------------
 # Optimizer + LR schedule
-# ---------------------------------------------------------------------------
-
 def make_optimizer(model: nn.Module, lr: float = 1e-4, weight_decay: float = 0.01) -> torch.optim.Optimizer:
     """AdamW is the default for diffusion. Weight decay helps generalization on small datasets."""
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -79,10 +73,7 @@ def make_lr_schedule(optimizer, num_warmup_steps: int, num_training_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-# ---------------------------------------------------------------------------
 # Classifier-Free Guidance dropout
-# ---------------------------------------------------------------------------
-
 def apply_cfg_dropout(
     embeddings: torch.Tensor,
     uncond_embedding: torch.Tensor,
@@ -107,9 +98,7 @@ def apply_cfg_dropout(
     return torch.where(mask[:, None, None], uncond_expanded, embeddings)
 
 
-# ---------------------------------------------------------------------------
 # Training step
-# ---------------------------------------------------------------------------
 
 def train_step(
     model: nn.Module,
@@ -175,10 +164,7 @@ def train_step(
     return loss.item()
 
 
-# ---------------------------------------------------------------------------
 # Checkpointing
-# ---------------------------------------------------------------------------
-
 def save_checkpoint(
     path: str,
     model: nn.Module,

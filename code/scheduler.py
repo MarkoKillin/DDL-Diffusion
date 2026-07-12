@@ -23,7 +23,7 @@ class NoiseScheduler(nn.Module):
         # Linear beta schedule. Small at t=0, larger at t=T-1.
         betas = torch.linspace(beta_start, beta_end, T, dtype=torch.float32)
 
-        # alpha_t = 1 - beta_t      ("how much signal survives one step")
+        # alpha_t = 1 - beta_t ("how much signal survives one step")
         alphas = 1.0 - betas
 
         # alpha_bar_t = prod_{s=1..t} alpha_s — lets us jump from x_0 to x_t in one shot.
@@ -50,8 +50,7 @@ class NoiseScheduler(nn.Module):
             t     : (B,)   long tensor of per-sample timesteps
             noise : same shape as x_0, sampled from N(0, I)
         """
-        # Index by t -> (B,), then reshape to (B, 1, 1, 1) so it broadcasts
-        # against (B, C, H, W). Forgetting the view is THE most common bug.
+        # Index by t -> (B,), then reshape to (B, 1, 1, 1) so it broadcasts against (B, C, H, W).
         sqrt_ab = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
         sqrt_one_minus_ab = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
 
