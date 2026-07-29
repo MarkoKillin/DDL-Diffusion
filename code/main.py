@@ -91,6 +91,11 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--warmup-steps", type=int, default=1000)
+    ap.add_argument("--ema-decay", type=float, default=0.9999,
+                    help="EMA decay. Lower it (e.g. 0.999) for short runs so the EMA actually tracks the model")
+    ap.add_argument("--no-ema-warmup", action="store_true",
+                    help="disable the EMA warmup ramp and use --ema-decay from step 0 "
+                         "(the EMA then stays close to its random init for thousands of steps)")
 
     ap.add_argument("--checkpoint-every", type=int, default=25)
     ap.add_argument("--log-every", type=int, default=50)
@@ -136,18 +141,32 @@ def main() -> None:
     optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = make_lr_schedule(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
 
+    amp_dtype = parse_amp(args.amp)
+    if amp_dtype is not None:
+        print(f"AMP enabled: {amp_dtype}")
+
+    # fp16 gradients underflow to zero without loss scaling, so fp16 needs a GradScaler.
+    # bf16 has fp32's exponent range and must NOT use one.
+    scaler = None
+    if amp_dtype is torch.float16:
+        if device == "cuda":
+            scaler = torch.amp.GradScaler("cuda")
+            print("fp16: GradScaler enabled")
+        else:
+            print(
+                f"WARNING: --amp fp16 on {device} has no GradScaler support, so gradients "
+                f"will silently underflow. Use --amp bf16 instead."
+            )
+
     start_step, start_epoch = 0, 0
     loss_history: list[float] = []
     if args.resume:
         start_step, start_epoch, loss_history = load_checkpoint(
-            args.resume, model, ema_model, optimizer, lr_scheduler, map_location=device,
+            args.resume, model, ema_model, optimizer, lr_scheduler,
+            map_location=device, scaler=scaler,
         )
         model.to(device); ema_model.to(device)
         print(f"resumed from {args.resume}: step={start_step}, epoch={start_epoch}")
-
-    amp_dtype = parse_amp(args.amp)
-    if amp_dtype is not None:
-        print(f"AMP enabled: {amp_dtype}")
 
     vae = None
     preview_cond = None
@@ -176,7 +195,10 @@ def main() -> None:
                 x_0=x_0,
                 context=context,
                 uncond_embedding=uncond_embedding,
+                ema_decay=args.ema_decay,
                 amp_dtype=amp_dtype,
+                scaler=scaler,
+                step=None if args.no_ema_warmup else global_step,
             )
 
             loss_history.append(loss)
@@ -194,6 +216,7 @@ def main() -> None:
             save_checkpoint(
                 str(ckpt_path), model, ema_model, optimizer, lr_scheduler,
                 step=global_step, epoch=epoch + 1, loss_history=loss_history,
+                scaler=scaler,
             )
             print(f"saved checkpoint -> {ckpt_path}")
 

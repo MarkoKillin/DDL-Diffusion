@@ -46,6 +46,20 @@ def _predict_eps_with_cfg(
     return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
 
+# Timestep grid
+def _make_timesteps(T: int, num_steps: int, device: torch.device | str) -> torch.Tensor:
+    """
+    Decreasing timestep grid of length num_steps, always spanning the full [0, T-1] range.
+
+    Sampling MUST start at t = T-1, where the schedule expects pure noise — which is
+    what we initialize x to. Asking for fewer steps means a COARSER STRIDE over the
+    whole schedule, not a shorter walk through its low-noise tail.
+    """
+    if num_steps >= T:
+        return torch.arange(T - 1, -1, -1, device=device)
+    return torch.linspace(T - 1, 0, num_steps, device=device).long()
+
+
 # DDPM sampler (slow, 1000 steps)
 @torch.no_grad()
 def sample_ddpm(
@@ -58,12 +72,18 @@ def sample_ddpm(
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
-    Generate latents by reversing the full DDPM noising process.
+    Generate latents by reversing the DDPM noising process.
 
-    Math per step:
-        mean = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * eps)
-        x_{t-1} = mean + sqrt(beta_t) * z         if t > 0
-        x_0     = mean                            if t == 0
+    Math per transition t -> prev (prev is the next entry in the timestep grid):
+        alpha_eff = alpha_bar_t / alpha_bar_prev      # signal kept over this jump
+        beta_eff  = 1 - alpha_eff
+        mean      = (1 / sqrt(alpha_eff)) * (x_t - (beta_eff / sqrt(1 - alpha_bar_t)) * eps)
+        x_prev    = mean + sqrt(beta_eff) * z         except on the final step
+        x_0       = mean                              on the final step
+
+    Written in terms of alpha_bar ratios so a strided grid (num_steps < T) is handled
+    correctly. On the full 1000-step grid alpha_eff and beta_eff reduce exactly to
+    alphas[t] and betas[t], so this is identical to the textbook per-step update.
 
     Args:
         model         : the U-Net (typically the EMA model in eval mode)
@@ -71,7 +91,8 @@ def sample_ddpm(
         cond_emb      : (B, 77, 768) text embeddings per sample
         uncond_emb    : (1, 77, 768) or (B, 77, 768) empty-string embedding
         guidance_scale: w in CFG. 7.5 is the SD default.
-        num_steps     : defaults to scheduler.T (the full 1000)
+        num_steps     : how many denoising steps; defaults to scheduler.T (the full 1000).
+                        Fewer steps stride the whole schedule rather than truncating it.
         generator     : torch.Generator for reproducible sampling
 
     Returns:
@@ -85,31 +106,34 @@ def sample_ddpm(
     if uncond_emb.shape[0] == 1:
         uncond_emb = uncond_emb.expand(B, -1, -1)
 
-    T = scheduler.T if num_steps is None else num_steps
+    timesteps = _make_timesteps(scheduler.T, scheduler.T if num_steps is None else num_steps, device)
 
     x = torch.randn(B, 4, 64, 64, device=device, generator=generator)
 
-    betas = scheduler.betas
-    alphas = scheduler.alphas
     alphas_cumprod = scheduler.alphas_cumprod
     sqrt_one_minus_ab = scheduler.sqrt_one_minus_alphas_cumprod
+    one = torch.tensor(1.0, device=device)
 
-    for step in reversed(range(T)):
-        t = torch.full((B,), step, device=device, dtype=torch.long)
+    for i, step in enumerate(timesteps):
+        is_last = i + 1 == len(timesteps)
+        t = torch.full((B,), step.item(), device=device, dtype=torch.long)
 
         eps = _predict_eps_with_cfg(model, x, t, cond_emb, uncond_emb, guidance_scale)
 
-        beta_t = betas[step]
-        alpha_t = alphas[step]
-        sqrt_om_ab_t = sqrt_one_minus_ab[step]
+        ab_t = alphas_cumprod[step]
+        ab_prev = one if is_last else alphas_cumprod[timesteps[i + 1]]
 
-        mean = (1.0 / torch.sqrt(alpha_t)) * (x - (beta_t / sqrt_om_ab_t) * eps)
+        # Effective per-jump alpha/beta. Equals alphas[t] / betas[t] on the full grid.
+        alpha_eff = ab_t / ab_prev
+        beta_eff = 1.0 - alpha_eff
 
-        if step > 0:
-            z = torch.randn(x.shape, device=device, generator=generator)
-            x = mean + torch.sqrt(beta_t) * z
-        else:
+        mean = (1.0 / torch.sqrt(alpha_eff)) * (x - (beta_eff / sqrt_one_minus_ab[step]) * eps)
+
+        if is_last:
             x = mean
+        else:
+            z = torch.randn(x.shape, device=device, generator=generator)
+            x = mean + torch.sqrt(beta_eff) * z
 
     return x
 
@@ -148,19 +172,20 @@ def sample_ddim(
         uncond_emb = uncond_emb.expand(B, -1, -1)
 
     # Evenly-spaced subset, decreasing from T-1 down to 0.
-    timesteps = torch.linspace(scheduler.T - 1, 0, num_steps, device=device).long()
+    timesteps = _make_timesteps(scheduler.T, num_steps, device)
 
     alphas_cumprod = scheduler.alphas_cumprod
 
     x = torch.randn(B, 4, 64, 64, device=device, generator=generator)
 
     for i, step in enumerate(timesteps):
+        is_last = i + 1 == len(timesteps)
         t = torch.full((B,), step.item(), device=device, dtype=torch.long)
 
         eps = _predict_eps_with_cfg(model, x, t, cond_emb, uncond_emb, guidance_scale)
 
         ab_t = alphas_cumprod[step]
-        ab_prev = alphas_cumprod[timesteps[i + 1]] if i + 1 < num_steps else torch.tensor(1.0, device=device)
+        ab_prev = torch.tensor(1.0, device=device) if is_last else alphas_cumprod[timesteps[i + 1]]
 
         # Estimate x_0 from current x_t and predicted noise.
         x0_pred = (x - torch.sqrt(1 - ab_t) * eps) / torch.sqrt(ab_t)
@@ -171,7 +196,7 @@ def sample_ddim(
         # Direction pointing to x_t.
         dir_xt = torch.sqrt(1 - ab_prev - sigma ** 2) * eps
 
-        if eta > 0 and i + 1 < num_steps:
+        if eta > 0 and not is_last:
             noise = torch.randn(x.shape, device=device, generator=generator)
             x = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
         else:

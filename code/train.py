@@ -34,14 +34,26 @@ def build_ema(model: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def ema_update(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999) -> None:
+def ema_update(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999, step: int | None = None) -> None:
     """
     In-place EMA update:   ema_param = decay * ema_param + (1 - decay) * live_param
 
     decay=0.9999 means each step the EMA absorbs 0.01% of the new weights.
-    Effective averaging window is ~10000 steps. Use 0.999 for shorter runs
-    so EMA actually tracks something.
+    Effective averaging window is ~10000 steps.
+
+    Because the EMA starts from the RANDOM INIT, a fixed 0.9999 leaves the shadow
+    weights mostly random for thousands of steps (90% random init at step 1000),
+    which makes early preview images pure noise no matter how well training goes.
+    Passing `step` applies the standard warmup ramp
+
+        effective_decay = min(decay, (1 + step) / (10 + step))
+
+    so the EMA tracks the live model closely at first and eases into `decay`.
+    Omit `step` to get the raw fixed-decay behaviour.
     """
+    if step is not None:
+        decay = min(decay, (1.0 + step) / (10.0 + step))
+
     for ema_p, p in zip(ema_model.parameters(), model.parameters()):
         ema_p.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
@@ -113,6 +125,8 @@ def train_step(
     grad_clip: float = 1.0,
     ema_decay: float = 0.9999,
     amp_dtype: torch.dtype | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+    step: int | None = None,
 ) -> float:
     """
     One optimizer step. Returns the scalar loss.
@@ -121,8 +135,11 @@ def train_step(
         x_0              : (B, 4, 64, 64)   clean latents
         context          : (B, 77, 768)     text embeddings
         uncond_embedding : (1, 77, 768)     empty-string embedding (for CFG dropout)
-        amp_dtype        : if torch.bfloat16, wraps forward+loss in autocast.
-                           Params stay fp32; no GradScaler needed for bf16.
+        amp_dtype        : if set, wraps forward+loss in autocast. Params stay fp32.
+        scaler           : REQUIRED when amp_dtype is torch.float16. fp16 gradients
+                           underflow to zero without loss scaling; bf16 has fp32's
+                           exponent range and needs no scaler, so pass None there.
+        step             : global step, forwarded to ema_update for the warmup ramp.
     """
     model.train()
     B = x_0.shape[0]
@@ -153,13 +170,23 @@ def train_step(
     # 6. Backward + optimizer step. Grad clip prevents the occasional spike
     #    from blowing up training (mostly an issue early on with random init).
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
+
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        # Unscale first so grad_clip measures true gradient norms, not scaled ones.
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
     lr_scheduler.step()
 
     # 7. Update the EMA shadow.
-    ema_update(ema_model, model, ema_decay)
+    ema_update(ema_model, model, ema_decay, step=step)
 
     return loss.item()
 
@@ -174,6 +201,7 @@ def save_checkpoint(
     step: int,
     epoch: int,
     loss_history: list | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> None:
     """Save everything needed to resume training."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -183,6 +211,7 @@ def save_checkpoint(
             "ema_model": ema_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "step": step,
             "epoch": epoch,
             "loss_history": loss_history or [],
@@ -198,6 +227,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     lr_scheduler,
     map_location: str = "cpu",
+    scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, int, list]:
     """Restore states in place. Returns (step, epoch, loss_history)."""
     ckpt = torch.load(path, map_location=map_location)
@@ -205,4 +235,6 @@ def load_checkpoint(
     ema_model.load_state_dict(ckpt["ema_model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
     return ckpt["step"], ckpt["epoch"], ckpt.get("loss_history", [])
