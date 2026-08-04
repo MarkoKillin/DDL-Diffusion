@@ -4,6 +4,8 @@ A latent text-to-image diffusion model built from scratch in PyTorch, trained on
 
 See [`plan.md`](plan.md) for the full design doc and math derivation. The Jupyter notebook at [`code/diffuser.ipynb`](code/diffuser.ipynb) is the recommended way to step through the project; the `.py` files under `code/` are the same components extracted for stand-alone use.
 
+[`RUNS.md`](RUNS.md) is the training run log — per-run config, what the numbers said, and what to change next. Read it before starting a run.
+
 ## Layout
 
 | File | What it is |
@@ -15,6 +17,7 @@ See [`plan.md`](plan.md) for the full design doc and math derivation. The Jupyte
 | `code/precompute.py` | CLI: encode dataset → `latents.pt` / `embeddings.pt` / `uncond_embedding.pt` |
 | `code/main.py` | CLI: training driver with checkpoint/resume and an optional sample-preview hook |
 | `code/diffuser.ipynb` | The walkthrough notebook |
+| `RUNS.md` | Training run log: config, results, findings, next actions |
 
 The three `.pt` tensor files are not committed (see `.gitignore`); regenerate them with `precompute.py`.
 
