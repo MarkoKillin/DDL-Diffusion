@@ -15,7 +15,6 @@ See [`plan.md`](plan.md) for the full design doc and math derivation. The Jupyte
 | `code/train.py` | EMA, optimizer/LR factories, CFG dropout, `train_step`, checkpoint save/load |
 | `code/sample.py` | `sample_ddpm` (1000 steps, faithful) and `sample_ddim` (50 steps, fast). Both do CFG. |
 | `code/precompute.py` | CLI: encode dataset → `latents.pt` / `embeddings.pt` / `uncond_embedding.pt` |
-| `code/main.py` | CLI: training driver with checkpoint/resume and an optional sample-preview hook |
 | `code/diffuser.ipynb` | The walkthrough notebook |
 | `RUNS.md` | Training run log: config, results, findings, next actions |
 
@@ -26,7 +25,6 @@ The three `.pt` tensor files are not committed (see `.gitignore`); regenerate th
 ```bash
 uv sync                                            # install deps
 python code/precompute.py --out-dir code/          # one-off: encode dataset → .pt files
-python code/main.py --epochs 200 --batch-size 8 --amp bf16 --preview
 ```
 
 `--preview` decodes a DDIM sample of `embeddings[0]` every 10 epochs into `previews/epoch_N.png` — useful because the loss curve alone is a poor signal for diffusion quality.
