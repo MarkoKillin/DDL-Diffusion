@@ -1,8 +1,9 @@
 """
 U-Net for latent diffusion.
 
-Predicts noise added to a latent given (x_t, t, text_context).
-Same shape in, same shape out: (B, 4, 64, 64) -> (B, 4, 64, 64).
+Predicts the diffusion target (eps or v, see scheduler.prediction_type) given a
+noisy latent, its timestep, and a text embedding. Same shape in, same shape out:
+(B, 4, H, W) -> (B, 4, H, W).
 
 Components (bottom-up):
   - sinusoidal_embedding / TimeEmbedding : encode integer t as a vector
@@ -10,8 +11,32 @@ Components (bottom-up):
   - SelfAttention                        : every spatial position attends to every other
   - CrossAttention                       : image queries text — how prompts steer generation
   - Downsample / Upsample                : strided conv / NN-interp + conv
-  - DownStage / UpStage                  : ResNet + SelfAttn + CrossAttn group
+  - DownStage / UpStage                  : ResNet(s) + SelfAttn + CrossAttn group
   - UNet                                 : full assembly with skip connections
+
+Changes since run 1, and why:
+
+  top_self_attn=False (was: always on)
+      Self-attention over the highest-resolution feature map was 44.2% of the
+      forward pass (two layers out of ~28) because it attends over H*W tokens:
+      4096 at 64x64 vs 1024 at 32x32 vs 256 at 16x16. Stable Diffusion has no
+      attention at its highest resolution for exactly this reason. Cross-attention
+      is kept there — it is only 0.8% and it is how text reaches full resolution.
+
+  num_res_blocks=2 (was: 1)
+      DDPM and SD use 2+. One block per stage left the skip connections dominating
+      and gave the network very little depth to compute with.
+
+  dropout=0.0 (was: 0.1)
+      Run 1 was underfitting by a wide margin — it fit its own training set worse
+      than a closed-form Gaussian projection. Dropout on an underfitting model is
+      pure damage, and it also inflated every logged training loss.
+
+  time_scale_shift=True (was: additive bias)
+      FiLM-style conditioning (ADM / SD): scale and shift the normalized activations
+      instead of adding a bias before GroupNorm, which partly normalizes the bias away.
+      Set False to restore run 1's additive path — needed to load a run-1 checkpoint,
+      since the shape of ResNetBlock.time_proj differs.
 """
 
 import math
@@ -19,6 +44,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _group_norm(channels: int, groups: int = 8) -> nn.GroupNorm:
+    """GroupNorm that degrades gracefully if channels isn't divisible by `groups`."""
+    while channels % groups != 0 and groups > 1:
+        groups //= 2
+    return nn.GroupNorm(num_groups=groups, num_channels=channels)
 
 
 # Time embedding
@@ -56,25 +88,42 @@ class TimeEmbedding(nn.Module):
 # ResNet block (with time conditioning)
 class ResNetBlock(nn.Module):
     """
-    GroupNorm -> SiLU -> Conv -> (add time) -> GroupNorm -> SiLU -> Dropout -> Conv -> + skip
+    GroupNorm -> SiLU -> Conv -> GroupNorm -> (time scale/shift) -> SiLU -> Dropout -> Conv -> + skip
 
     GroupNorm (not BatchNorm) because diffusion uses tiny batches and GroupNorm
-    is per-sample. Time embedding is projected and broadcast across spatial dims.
-    Skip uses 1x1 conv when channels change, identity otherwise.
+    is per-sample. Skip uses 1x1 conv when channels change, identity otherwise.
+
+    time_scale_shift=True applies FiLM AFTER norm2: h = norm2(h) * (1 + scale) + shift.
+    time_scale_shift=False adds the projected time embedding as a bias BEFORE norm2,
+    which is what DDPM and run 1 did — simpler, but GroupNorm removes part of it.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        time_emb_dim: int,
+        dropout: float = 0.0,
+        time_scale_shift: bool = True,
+    ):
         super().__init__()
-        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=in_channels)
+        self.time_scale_shift = time_scale_shift
+
+        self.norm1 = _group_norm(in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
-        self.time_proj = nn.Linear(time_emb_dim, out_channels)
+        self.time_proj = nn.Linear(time_emb_dim, out_channels * 2 if time_scale_shift else out_channels)
 
-        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        self.norm2 = _group_norm(out_channels)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
         self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+        if time_scale_shift:
+            # Start as the identity transform so training begins from a clean residual block.
+            nn.init.zeros_(self.time_proj.weight)
+            nn.init.zeros_(self.time_proj.bias)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         residual = self.skip(x)
@@ -83,11 +132,13 @@ class ResNetBlock(nn.Module):
         h = F.silu(h)
         h = self.conv1(h)
 
-        # Broadcast time bias across spatial dims.
-        t_bias = self.time_proj(F.silu(t_emb))[:, :, None, None]
-        h = h + t_bias
+        t_out = self.time_proj(F.silu(t_emb))
+        if self.time_scale_shift:
+            scale, shift = t_out.chunk(2, dim=1)
+            h = self.norm2(h) * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+        else:
+            h = self.norm2(h + t_out[:, :, None, None])
 
-        h = self.norm2(h)
         h = F.silu(h)
         h = self.dropout(h)
         h = self.conv2(h)
@@ -100,6 +151,8 @@ class SelfAttention(nn.Module):
     """
     Each spatial position attends to every other spatial position.
     Multi-head, with head_dim=32 -> num_heads = channels // 32.
+
+    Cost is O(H*W * H*W * C), so this is affordable only at low resolution.
     """
 
     def __init__(self, channels: int, head_dim: int = 32):
@@ -109,7 +162,7 @@ class SelfAttention(nn.Module):
         self.num_heads = channels // head_dim
         self.head_dim = head_dim
 
-        self.norm = nn.GroupNorm(num_groups=8, num_channels=channels)
+        self.norm = _group_norm(channels)
         self.qkv = nn.Linear(channels, channels * 3)
         self.proj_out = nn.Linear(channels, channels)
 
@@ -141,6 +194,9 @@ class CrossAttention(nn.Module):
     """
     Q from image features, K and V from text embeddings (B, 77, 768).
     This is THE mechanism by which text controls the generated image.
+
+    Cost is O(H*W * 77 * C) — cheap even at full resolution, because the text
+    sequence is short. Keep this everywhere self-attention gets dropped.
     """
 
     def __init__(self, channels: int, context_dim: int = 768, head_dim: int = 32):
@@ -150,7 +206,7 @@ class CrossAttention(nn.Module):
         self.num_heads = channels // head_dim
         self.head_dim = head_dim
 
-        self.norm = nn.GroupNorm(num_groups=8, num_channels=channels)
+        self.norm = _group_norm(channels)
         self.to_q = nn.Linear(channels, channels)
         self.to_k = nn.Linear(context_dim, channels)
         self.to_v = nn.Linear(context_dim, channels)
@@ -208,34 +264,46 @@ class Upsample(nn.Module):
 
 
 # Stages
-class DownStage(nn.Module):
-    """ResNet -> SelfAttn -> CrossAttn. Channel change happens in the ResNet."""
+class Stage(nn.Module):
+    """
+    num_res_blocks x ResNet -> [SelfAttn] -> CrossAttn.
 
-    def __init__(self, in_ch: int, out_ch: int, time_emb_dim: int, context_dim: int):
+    The channel change happens in the first ResNet; the rest are out_ch -> out_ch.
+    Used for both the encoder and the decoder — an UpStage just receives an in_ch
+    that already includes the concatenated skip channels.
+
+    Note this keeps ONE skip per stage regardless of num_res_blocks, rather than
+    DDPM's one-skip-per-block. Less standard, but it keeps the assembly below
+    readable and still buys the depth, which is the point.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        time_emb_dim: int,
+        context_dim: int,
+        num_res_blocks: int = 2,
+        use_self_attn: bool = True,
+        dropout: float = 0.0,
+        time_scale_shift: bool = True,
+    ):
         super().__init__()
-        self.res = ResNetBlock(in_ch, out_ch, time_emb_dim)
-        self.self_attn = SelfAttention(out_ch)
+        self.res = nn.ModuleList([
+            ResNetBlock(
+                in_ch if i == 0 else out_ch, out_ch, time_emb_dim,
+                dropout=dropout, time_scale_shift=time_scale_shift,
+            )
+            for i in range(num_res_blocks)
+        ])
+        self.self_attn = SelfAttention(out_ch) if use_self_attn else None
         self.cross_attn = CrossAttention(out_ch, context_dim=context_dim)
 
     def forward(self, x, t_emb, context):
-        x = self.res(x, t_emb)
-        x = self.self_attn(x)
-        x = self.cross_attn(x, context)
-        return x
-
-
-class UpStage(nn.Module):
-    """Same as DownStage; expects in_ch to already include the skip channels."""
-
-    def __init__(self, in_ch: int, out_ch: int, time_emb_dim: int, context_dim: int):
-        super().__init__()
-        self.res = ResNetBlock(in_ch, out_ch, time_emb_dim)
-        self.self_attn = SelfAttention(out_ch)
-        self.cross_attn = CrossAttention(out_ch, context_dim=context_dim)
-
-    def forward(self, x, t_emb, context):
-        x = self.res(x, t_emb)
-        x = self.self_attn(x)
+        for block in self.res:
+            x = block(x, t_emb)
+        if self.self_attn is not None:
+            x = self.self_attn(x)
         x = self.cross_attn(x, context)
         return x
 
@@ -245,20 +313,28 @@ class UNet(nn.Module):
     """
     Latent diffusion U-Net.
 
-    Encoder: 3 down stages at channel widths (c1, c2, c3) = (64, 128, 256).
-    Skips saved after init_conv and after each down stage.
+    Encoder: 3 stages at channel widths (c1, c2, c3) = (base, 2*base, 4*base),
+             each followed by a 2x downsample. Skips saved after init_conv and
+             after each stage.
     Bottleneck: ResNet -> SelfAttn -> CrossAttn -> ResNet at the deepest level.
-    Decoder: mirror of encoder, each stage concatenates the matching skip
-             along the channel dim before the ResNet.
+    Decoder: mirror of the encoder; each stage concatenates the matching skip
+             along the channel dim before its ResNets.
+
+    Fully resolution-agnostic — the same weights work on 32x32 or 64x64 latents.
+    Only the samplers need to know the spatial size.
     """
 
     def __init__(
         self,
         in_channels: int = 4,
         out_channels: int = 4,
-        base_channels: int = 64,
+        base_channels: int = 128,
         time_dim: int = 128,
         context_dim: int = 768,
+        num_res_blocks: int = 2,
+        top_self_attn: bool = False,
+        dropout: float = 0.0,
+        time_scale_shift: bool = True,
     ):
         super().__init__()
         c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
@@ -268,41 +344,52 @@ class UNet(nn.Module):
 
         self.init_conv = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
 
-        # Encoder.
-        self.down1 = DownStage(c1, c1, t_emb_dim, context_dim)
+        stage_kwargs = dict(
+            time_emb_dim=t_emb_dim, context_dim=context_dim, num_res_blocks=num_res_blocks,
+            dropout=dropout, time_scale_shift=time_scale_shift,
+        )
+
+        # Encoder. Stage 1 runs at the full latent resolution — self-attention there
+        # is the single most expensive thing in the network, hence the flag.
+        self.down1 = Stage(c1, c1, use_self_attn=top_self_attn, **stage_kwargs)
         self.down1_sample = Downsample(c1)
 
-        self.down2 = DownStage(c1, c2, t_emb_dim, context_dim)
+        self.down2 = Stage(c1, c2, use_self_attn=True, **stage_kwargs)
         self.down2_sample = Downsample(c2)
 
-        self.down3 = DownStage(c2, c3, t_emb_dim, context_dim)
+        self.down3 = Stage(c2, c3, use_self_attn=True, **stage_kwargs)
         self.down3_sample = Downsample(c3)
 
         # Bottleneck
-        self.mid_res1 = ResNetBlock(c3, c3, t_emb_dim)
+        self.mid_res1 = ResNetBlock(c3, c3, t_emb_dim, dropout=dropout, time_scale_shift=time_scale_shift)
         self.mid_self_attn = SelfAttention(c3)
         self.mid_cross_attn = CrossAttention(c3, context_dim=context_dim)
-        self.mid_res2 = ResNetBlock(c3, c3, t_emb_dim)
+        self.mid_res2 = ResNetBlock(c3, c3, t_emb_dim, dropout=dropout, time_scale_shift=time_scale_shift)
 
         # Decoder. Up stages receive in_ch = upsample_ch + skip_ch.
         self.up3_sample = Upsample(c3)
-        self.up3 = UpStage(c3 + c3, c3, t_emb_dim, context_dim)
+        self.up3 = Stage(c3 + c3, c3, use_self_attn=True, **stage_kwargs)
 
         self.up2_sample = Upsample(c3)
-        self.up2 = UpStage(c3 + c2, c2, t_emb_dim, context_dim)
+        self.up2 = Stage(c3 + c2, c2, use_self_attn=True, **stage_kwargs)
 
         self.up1_sample = Upsample(c2)
-        self.up1 = UpStage(c2 + c1, c1, t_emb_dim, context_dim)
+        self.up1 = Stage(c2 + c1, c1, use_self_attn=top_self_attn, **stage_kwargs)
 
-        self.out_norm = nn.GroupNorm(num_groups=8, num_channels=c1 + c1)
+        self.out_norm = _group_norm(c1 + c1)
         self.out_conv = nn.Conv2d(c1 + c1, out_channels, kernel_size=3, padding=1)
+
+        # Zero-init the output layer: the network starts by predicting exactly 0,
+        # so the first steps only have to learn a correction.
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        x       : (B, 4, 64, 64)   noisy latent
+        x       : (B, 4, H, W)     noisy latent
         t       : (B,)             timestep per sample
         context : (B, 77, 768)     text embedding (or uncond_embedding)
-        Returns : (B, 4, 64, 64)   predicted noise
+        Returns : (B, 4, H, W)     predicted eps or v
         """
         t_emb = self.time_embedding(t)
 

@@ -6,6 +6,80 @@ said, and what to change next. See [`plan.md`](plan.md) for the design and
 
 ---
 
+## Run 2 — planned · code landed, not yet trained
+
+Diagnosis from run 1's checkpoint: **the model underfits by a wide margin; 833 images is
+not the binding constraint.** Three independent lines of evidence:
+
+1. Sampling from training caption #0 lands 124.68 from training latent #0 — **0.99× the
+   median distance between two random different Pokemon.** After 200 exposures, its output
+   for a memorized caption is indistinguishable from an unrelated one.
+2. A closed-form Gaussian fitted to the 833 latents scores uniform-t **0.0257** where the
+   trained network scores **0.0629** — 2.4× better on the network's own training set, 6.5×
+   at t=25. (That Gaussian is degenerate and does not generalize; the point is only that
+   the network has not *fit* what it was shown.) Empirical-posterior floor is ~0.
+3. Four numbers — the per-channel latent means — carry **58.6%** of total latent energy.
+   Generated channel means were 83% off, with the spread across channels collapsed to 13%
+   of the data's.
+
+### Code changes landed
+
+| Area | Change | Why |
+|---|---|---|
+| `precompute.py` | per-channel latent normalization → `latent_stats.pt` | fixed-pattern share of latent energy 65.8% → 15.7% |
+| `precompute.py` | `--resolution` (default 256), `--hflip`, `latent_dist.mode()` | 4× cheaper modeling task; 2× data for one VAE pass |
+| `scheduler.py` | `zero_terminal_snr=True` (Lin et al. Alg. 1) | kills the `0.0397 · x_0` leak at t=999 |
+| `scheduler.py` | `prediction_type="v"` + `to_x0_and_eps` | required at ᾱ=0; also flattens the loss across t |
+| `scheduler.py` | `cosine` schedule option, `trailing` timestep spacing | |
+| `unet.py` | `top_self_attn=False`, `num_res_blocks=2`, `dropout=0.0` | 1.79× speedup; depth; dropout hurts an underfitting model |
+| `unet.py` | FiLM time conditioning, zero-init `out_conv`, resolution-agnostic | |
+| `sample.py` | `guidance_rescale` (Lin et al. §3.4), `latent_shape` param, DDPM in x₀-posterior form | fixes CFG over-exposure; unblocks 32×32; finite at ᾱ=0 |
+| `train.py` | `validation_loss`, `make_split` (mirror-leakage safe), `pick_amp_dtype` | run 1 had no val split and logged dropout-inflated train loss |
+
+### Recommended config
+
+Measured params and FLOPs per forward (attention matmuls included):
+
+| config | latent | params | GFLOP | attn share | samples/hr vs run 1 |
+|---|---|---|---|---|---|
+| run 1: base64, 1 blk, top-attn | 64×64 | 12.7M | 20.06 | **50%** | 1.00× |
+| base64, 2 blk, no top-attn | 32×32 | 17.4M | 3.69 | 4% | 5.44× |
+| **base96, 2 blk, no top-attn** | **32×32** | **35.5M** | **7.97** | **3%** | **2.52×** |
+| base128, 2 blk, no top-attn | 32×32 | 60.1M | 13.87 | 2% | 1.45× |
+
+`base96 @ 32×32` is the pick: 2.8× run 1's capacity at 0.40× the cost per sample. Then
+batch 32 (activations are 4× smaller, so this is finally affordable), `clip_x0=4.6`
+(99.99th percentile of |x₀| on the normalized latents), CFG 2.0 with rescale 0.7,
+`PREVIEW = True`, and a 10% held-out split via `make_split`.
+
+Run 1 spent 166,400 sample-presentations. Budget at least 5–10× that.
+
+### Two corrections to the run-1 findings below
+
+- **Finding 1 has the t-direction backwards.** It claims "at t≈0 loss is ~0.002, at t≈999
+  even a perfect model scores ~1." It is the reverse: the Bayes-optimal ε-loss for
+  unit-variance data is exactly ᾱ_t, so it is *highest* at low t. The measured profile
+  agrees — 0.3254 at t=25 falling to 0.0014 at t=975. This matters because it makes "the
+  model is bad at low t" read like the expected shape. The real implication: unweighted ε
+  puts 31.5% of its signal below t=100 and 0.3% above t=750.
+- **Min-SNR-γ=5 is the wrong tool once you switch to v-prediction.** On top of v it peaks
+  at SNR=γ (ᾱ=0.833, t≈116) and decays both ways, pushing 45% of the signal into
+  t=100–250 and 0.4% above t=750 — reintroducing the low-noise bias. Unweighted v-loss is
+  already exactly uniform per timestep at the optimum. `min_snr_gamma` defaults to `None`.
+- **`AMP = "bf16"` is not free on a T4.** bf16 needs compute capability ≥ 8.0; Turing is
+  7.5. `train.pick_amp_dtype("auto")` picks bf16 only where supported, else fp16.
+
+### Note on run-1 checkpoints
+
+`epoch_200.pt` will not load into the new `UNet` — `Stage.res` is now a `ModuleList`, so
+keys gained a `.0`. The parameter count is unchanged (12,658,628) with
+`UNet(base_channels=64, num_res_blocks=1, top_self_attn=True, dropout=0.1,
+time_scale_shift=False)` plus `NoiseScheduler(zero_terminal_snr=False,
+prediction_type="eps")`, so a `.res.` → `.res.0.` key remap is enough if you want to
+re-evaluate run 1 against the fixed samplers. Otherwise `git show b4f6080:code/unet.py`.
+
+---
+
 ## Run 1 — 2026-08-04 · 200 epochs · completed, plateaued early
 
 Full run on Colab from `code/diffuser.ipynb`. Checkpoints on Drive, not committed.
@@ -57,10 +131,14 @@ Diagnostics for all three are now in the notebook (see below).
 ### Findings
 
 **1. Uniform-`t` MSE is a poor progress metric, and partly explains the flatness.**
-Most per-step variance is just *which `t` was drawn* — at `t≈0` loss is ~0.002, at
-`t≈999` even a perfect model scores ~1. That is the entire 0.002–0.5 band in the
-plot. A flat average can hide real progress in the mid-`t` range that decides image
-structure. Bin the loss by `t` instead.
+Most per-step variance is just *which `t` was drawn* — and the direction is the opposite of
+what you might guess: at `t≈25` the measured loss is 0.325, falling to 0.0014 at `t≈975`.
+The Bayes-optimal ε-loss for unit-variance data is exactly `alphas_cumprod[t]`, so ε is
+*hardest* to recover when the latent is nearly clean and trivial when `x_t` is almost pure
+noise. That is the entire 0.002–0.5 band in the plot. Consequence: the aggregate number is
+dominated by the low-noise tail (31.5% of the signal below `t=100`, 0.3% above `t=750`), so
+it says almost nothing about the mid/high-`t` range that decides image structure. Bin the
+loss by `t` instead — and see the run-2 note above on why v-prediction fixes the weighting.
 
 **2. The reported 0.07 is inflated by dropout.** `ResNetBlock` carries `p=0.1`
 (`code/unet.py:74`) and the loop logs train-mode loss. Eval-mode loss reads lower, so
