@@ -181,41 +181,87 @@ def apply_cfg_dropout(
 
 # Train / validation split
 def make_split(
-    n_total: int,
-    n_original: int,
-    hflip: bool,
+    group_ids: torch.Tensor,
     val_frac: float = 0.1,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Leakage-safe train/val split over the latents precompute.py produced.
 
-    The trap: with --hflip, row i and row i + n_original are the SAME Pokemon. Splitting
-    naively puts a mirror image of a training example in the validation set, and the
-    validation loss then measures nothing. So we split at the ORIGINAL image level and
-    send both members of a pair to the same side.
+    Splits on GROUP (the source image), never on row. Every augmented view of one
+    Pokemon — all K crops, both flips — lands on the same side of the boundary. Without
+    this the validation set holds mirrors and crops of training images and the validation
+    loss measures nothing.
 
     Args:
-        n_total     : latents.shape[0]
-        n_original  : latent_stats["n_original"]
-        hflip       : latent_stats["hflip"]
+        group_ids : (N_lat,) from latent_stats["group_ids"]
     Returns:
-        (train_idx, val_idx) as long tensors.
+        (train_rows, val_rows) as sorted long tensors of row indices into latents.pt.
     """
+    groups = torch.unique(group_ids)
     g = torch.Generator().manual_seed(seed)
-    order = torch.randperm(n_original, generator=g)
-    n_val = int(round(n_original * val_frac))
-    val_base, train_base = order[:n_val], order[n_val:]
+    order = groups[torch.randperm(len(groups), generator=g)]
 
-    if hflip:
-        assert n_total == 2 * n_original, f"expected {2 * n_original} latents with hflip, got {n_total}"
-        val_idx = torch.cat([val_base, val_base + n_original])
-        train_idx = torch.cat([train_base, train_base + n_original])
-    else:
-        assert n_total == n_original, f"expected {n_original} latents without hflip, got {n_total}"
-        val_idx, train_idx = val_base, train_base
+    n_val = int(round(len(groups) * val_frac))
+    val_groups = set(order[:n_val].tolist())
 
-    return train_idx.sort().values, val_idx.sort().values
+    is_val = torch.tensor([int(gid) in val_groups for gid in group_ids.tolist()])
+    val_rows = torch.nonzero(is_val, as_tuple=True)[0]
+    train_rows = torch.nonzero(~is_val, as_tuple=True)[0]
+    return train_rows, val_rows
+
+
+class LatentCaptionDataset(torch.utils.data.Dataset):
+    """
+    Joins latents to caption embeddings by group id, and samples a caption variant.
+
+    Why not TensorDataset: a 77x768 embedding is 237 KB, so duplicating one per crop
+    would make embeddings.pt the dominant output (K=4 with hflip pushes it past 1.5 GB).
+    Storing captions once per (image, variant) and joining here keeps it at ~400 MB.
+
+    sample_variant=True picks uniformly among that image's caption variants on every
+    __getitem__, so the caption augmentation is fresh each epoch rather than a fixed
+    pairing. Set False for deterministic evaluation (always variant 0, the original).
+
+    Args:
+        latents        : (N_lat, C, H, W)
+        group_ids      : (N_lat,)   source image per latent
+        embeddings     : (N_cap, 77, 768)
+        caption_groups : (N_cap,)   source image per caption
+    """
+
+    def __init__(self, latents, group_ids, embeddings, caption_groups, sample_variant: bool = True):
+        self.latents = latents
+        self.embeddings = embeddings
+        self.group_ids = group_ids
+        self.sample_variant = sample_variant
+
+        # group -> LongTensor of caption rows. Variant order is preserved, so column 0
+        # is always the original caption.
+        n_groups = int(caption_groups.max().item()) + 1
+        counts = torch.bincount(caption_groups, minlength=n_groups)
+        if counts.min() == 0:
+            missing = int((counts == 0).nonzero()[0])
+            raise ValueError(f"image {missing} has no captions")
+        if counts.min() != counts.max():
+            raise ValueError(f"ragged caption variants per image: {counts.min()}..{counts.max()}")
+
+        self.n_variants = int(counts[0].item())
+        table = torch.empty(n_groups, self.n_variants, dtype=torch.long)
+        fill = torch.zeros(n_groups, dtype=torch.long)
+        for row, gid in enumerate(caption_groups.tolist()):
+            table[gid, fill[gid]] = row
+            fill[gid] += 1
+        self.caption_table = table
+
+    def __len__(self):
+        return self.latents.shape[0]
+
+    def __getitem__(self, i):
+        gid = int(self.group_ids[i])
+        row = self.caption_table[gid]
+        j = row[torch.randint(self.n_variants, (1,)).item()] if self.sample_variant else row[0]
+        return self.latents[i], self.embeddings[j]
 
 
 # Loss
@@ -388,6 +434,7 @@ def save_checkpoint(
     loss_history: list | None = None,
     scaler: torch.amp.GradScaler | None = None,
     config: dict | None = None,
+    slim: bool = False,
 ) -> None:
     """
     Save everything needed to resume training.
@@ -395,22 +442,30 @@ def save_checkpoint(
     `config` should carry the model/scheduler kwargs so a checkpoint can be rebuilt
     without guessing. Run 1's checkpoints did not, which is why evaluating one now
     requires remembering base_channels=64 / num_res_blocks=1 / top_self_attn=True.
+
+    slim=True drops the optimizer, LR-schedule and scaler state — everything only needed
+    to RESUME. A checkpoint holds 4 copies of the weights (model, EMA, and AdamW's two
+    moments), so at run 2's 35.5M params each was 569 MB and 12 of them filled a Drive.
+    Slim halves that and still loads in every eval cell. Keep ONE full checkpoint as the
+    resume point and make the rest slim.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "ema_model": ema_model.state_dict(),
+    payload = {
+        "model": model.state_dict(),
+        "ema_model": ema_model.state_dict(),
+        "step": step,
+        "epoch": epoch,
+        "loss_history": loss_history or [],
+        "config": config or {},
+        "slim": slim,
+    }
+    if not slim:
+        payload.update({
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
             "scaler": scaler.state_dict() if scaler is not None else None,
-            "step": step,
-            "epoch": epoch,
-            "loss_history": loss_history or [],
-            "config": config or {},
-        },
-        path,
-    )
+        })
+    torch.save(payload, path)
 
 
 def load_checkpoint(
@@ -422,8 +477,18 @@ def load_checkpoint(
     map_location: str = "cpu",
     scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, int, list]:
-    """Restore states in place. Returns (step, epoch, loss_history)."""
+    """
+    Restore states in place. Returns (step, epoch, loss_history).
+
+    Raises on a slim checkpoint, which has no optimizer state and cannot resume — load
+    its weights directly instead (`ckpt["ema_model"]`), as the eval cells do.
+    """
     ckpt = torch.load(path, map_location=map_location)
+    if ckpt.get("slim") or "optimizer" not in ckpt:
+        raise ValueError(
+            f"{path} is a slim checkpoint (no optimizer state) and cannot resume training. "
+            f"Use it for evaluation via ckpt['ema_model'], or resume from a full one."
+        )
     model.load_state_dict(ckpt["model"])
     ema_model.load_state_dict(ckpt["ema_model"])
     optimizer.load_state_dict(ckpt["optimizer"])
