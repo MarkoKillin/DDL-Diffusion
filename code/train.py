@@ -230,11 +230,15 @@ class LatentCaptionDataset(torch.utils.data.Dataset):
         caption_groups : (N_cap,)   source image per caption
     """
 
-    def __init__(self, latents, group_ids, embeddings, caption_groups, sample_variant: bool = True):
+    def __init__(self, latents, group_ids, embeddings, caption_groups,
+                 view_params=None, sample_variant: bool = True):
         self.latents = latents
         self.embeddings = embeddings
         self.group_ids = group_ids
         self.sample_variant = sample_variant
+        # (N_lat, view_dim) micro-conditioning: which crop box / flip this latent is.
+        # Zeros when unused, which the U-Net treats as "no view conditioning".
+        self.view_params = view_params
 
         # group -> LongTensor of caption rows. Variant order is preserved, so column 0
         # is always the original caption.
@@ -261,7 +265,8 @@ class LatentCaptionDataset(torch.utils.data.Dataset):
         gid = int(self.group_ids[i])
         row = self.caption_table[gid]
         j = row[torch.randint(self.n_variants, (1,)).item()] if self.sample_variant else row[0]
-        return self.latents[i], self.embeddings[j]
+        view = self.view_params[i] if self.view_params is not None else torch.zeros(0)
+        return self.latents[i], self.embeddings[j], view
 
 
 # Loss
@@ -273,17 +278,22 @@ def diffusion_loss(
     t: torch.Tensor,
     noise: torch.Tensor,
     min_snr_gamma: float | None = None,
+    view: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Min-SNR-weighted MSE against whatever the scheduler says the target is.
 
     Returns a scalar. Per-sample MSE is computed first, then weighted, so the
     weighting is per-timestep rather than smeared across the batch.
+
+    `view` is the augmentation micro-conditioning (crop box + flip). Passing it is what
+    stops the 8 augmented views of one caption from being an unpredictable 60% of the
+    target variance — see unet.UNet's view_dim note.
     """
     x_t = noise_scheduler.q_sample(x_0, t, noise)
     target = noise_scheduler.get_target(x_0, noise, t)
 
-    pred = model(x_t, t, context)
+    pred = model(x_t, t, context, view)
 
     per_sample = F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3))
     weight = noise_scheduler.loss_weight(t, min_snr_gamma).to(per_sample)
@@ -304,6 +314,7 @@ def train_step(
     grad_clip: float = 1.0,
     ema_decay: float = 0.9999,
     min_snr_gamma: float | None = None,
+    view: torch.Tensor | None = None,
     amp_dtype: torch.dtype | None = None,
     scaler: torch.amp.GradScaler | None = None,
     step: int | None = None,
@@ -341,9 +352,11 @@ def train_step(
     # 4. Forward noising, prediction, weighted MSE.
     if amp_dtype is not None:
         with torch.autocast(device_type=device.type, dtype=amp_dtype):
-            loss = diffusion_loss(model, noise_scheduler, x_0, context, t, noise, min_snr_gamma)
+            loss = diffusion_loss(model, noise_scheduler, x_0, context, t, noise,
+                                  min_snr_gamma, view)
     else:
-        loss = diffusion_loss(model, noise_scheduler, x_0, context, t, noise, min_snr_gamma)
+        loss = diffusion_loss(model, noise_scheduler, x_0, context, t, noise,
+                              min_snr_gamma, view)
 
     # 5. Backward + optimizer step. Grad clip prevents the occasional spike
     #    from blowing up training (mostly an issue early on with random init).
@@ -376,6 +389,7 @@ def validation_loss(
     x_0: torch.Tensor,
     context: torch.Tensor,
     min_snr_gamma: float | None = None,
+    view: torch.Tensor | None = None,
     batch_size: int = 32,
     seed: int = 1234,
 ) -> dict[str, float]:
@@ -406,9 +420,10 @@ def validation_loss(
         tb = t_all[i : i + batch_size].to(device)
         nb = noise_all[i : i + batch_size].to(device)
 
+        vb = view[i : i + batch_size].to(device) if view is not None else None
         x_t = noise_scheduler.q_sample(xb, tb, nb)
         target = noise_scheduler.get_target(xb, nb, tb)
-        pred = model(x_t, tb, cb)
+        pred = model(x_t, tb, cb, vb)
 
         per_sample = F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3))
         w = noise_scheduler.loss_weight(tb, min_snr_gamma).to(per_sample)

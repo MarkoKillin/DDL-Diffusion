@@ -32,6 +32,19 @@ Changes since run 1, and why:
       than a closed-form Gaussian projection. Dropout on an underfitting model is
       pure damage, and it also inflated every logged training loss.
 
+  view_dim  (new in run 4)
+      SDXL-style micro-conditioning. Run 3 augmented each image into 8 views (4 crops x
+      2 flips) and measured that 59.9% of the target variance became UNPREDICTABLE from
+      the caption — the model cannot know which framing it is being asked for. An
+      L2-trained model resolves that by predicting the average of the 8 views, and
+      decoding an average is exactly what a blurry sample looks like. Flip alone
+      accounted for 38.6% of it, so trimming crops does not fix it.
+
+      Passing the crop box and flip flag as conditioning turns that noise back into
+      signal: at inference you request the canonical view and the caption->image mapping
+      is single-valued again. The projection is zero-initialised, so a fresh model starts
+      exactly as if the conditioning were absent.
+
   time_scale_shift=True (was: additive bias)
       FiLM-style conditioning (ADM / SD): scale and shift the normalized activations
       instead of adding a bias before GroupNorm, which partly normalizes the bias away.
@@ -335,12 +348,28 @@ class UNet(nn.Module):
         top_self_attn: bool = False,
         dropout: float = 0.0,
         time_scale_shift: bool = True,
+        view_dim: int = 0,
     ):
         super().__init__()
         c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
 
         self.time_embedding = TimeEmbedding(time_dim)
         t_emb_dim = self.time_embedding.out_dim
+
+        # Micro-conditioning on the augmentation view. Added to the time embedding, the
+        # standard place for global scalar conditioning. The output layer is zero-init so
+        # an untrained model behaves exactly as if view_dim=0.
+        self.view_dim = view_dim
+        if view_dim > 0:
+            self.view_embed = nn.Sequential(
+                nn.Linear(view_dim, t_emb_dim),
+                nn.SiLU(),
+                nn.Linear(t_emb_dim, t_emb_dim),
+            )
+            nn.init.zeros_(self.view_embed[-1].weight)
+            nn.init.zeros_(self.view_embed[-1].bias)
+        else:
+            self.view_embed = None
 
         self.init_conv = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
 
@@ -384,14 +413,25 @@ class UNet(nn.Module):
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        context: torch.Tensor,
+        view: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         x       : (B, 4, H, W)     noisy latent
         t       : (B,)             timestep per sample
         context : (B, 77, 768)     text embedding (or uncond_embedding)
+        view    : (B, view_dim)    augmentation view params; None = all zeros
         Returns : (B, 4, H, W)     predicted eps or v
         """
         t_emb = self.time_embedding(t)
+        if self.view_embed is not None:
+            if view is None:
+                view = torch.zeros(x.shape[0], self.view_dim, device=x.device, dtype=t_emb.dtype)
+            t_emb = t_emb + self.view_embed(view.to(t_emb.dtype))
 
         # Encoder.
         h = self.init_conv(x)

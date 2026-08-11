@@ -48,6 +48,7 @@ from pathlib import Path
 
 import torch
 from torchvision import transforms as T
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 
@@ -65,6 +66,12 @@ _NORMALIZE = T.Compose([
     T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
+# The view vector fed to UNet as micro-conditioning: [top, left, height, width, flip],
+# with the box normalized to [0, 1] against the source image. The canonical full-frame,
+# unflipped view is therefore [0, 0, 1, 1, 0].
+VIEW_DIM = 5
+CANONICAL_VIEW = (0.0, 0.0, 1.0, 1.0, 0.0)
+
 
 def build_preprocess(resolution: int = 256, crop: bool = False, scale=(0.8, 1.0)):
     """
@@ -73,12 +80,36 @@ def build_preprocess(resolution: int = 256, crop: bool = False, scale=(0.8, 1.0)
                  at full source resolution and downsampled once rather than twice.
 
     Both end at [-1, 1], which is what the SD VAE expects.
+
+    Kept for the notebook's preview of what the crops look like. The encoding path uses
+    crop_with_params below, which returns the box alongside the tensor.
     """
     if crop:
         geom = T.RandomResizedCrop(resolution, scale=scale, ratio=(0.9, 1.1), antialias=True)
     else:
         geom = T.Compose([T.Resize(resolution, antialias=True), T.CenterCrop(resolution)])
     return T.Compose([geom, _NORMALIZE])
+
+
+def crop_with_params(img, resolution: int, crop: bool, scale=(0.8, 1.0), ratio=(0.9, 1.1),
+                     flip: bool = False):
+    """
+    Returns (tensor in [-1,1], view vector) so the crop geometry can be recorded and used
+    as conditioning. Run 3 threw this information away, which is why 59.9% of its target
+    variance was unpredictable from the caption.
+    """
+    W, H = img.size
+    if crop:
+        top, left, h, w = T.RandomResizedCrop.get_params(img, list(scale), list(ratio))
+    else:
+        # Resize(shorter side) + CenterCrop is a centred square of side min(H, W).
+        s = min(H, W)
+        top, left, h, w = (H - s) // 2, (W - s) // 2, s, s
+    out = TF.resized_crop(img, top, left, h, w, [resolution, resolution], antialias=True)
+    if flip:
+        out = TF.hflip(out)
+    view = (top / H, left / W, h / H, w / W, float(flip))
+    return _NORMALIZE(out), view
 
 
 # Caption variants
@@ -137,27 +168,32 @@ def build_caption_variants(captions: list[str], n_variants: int) -> tuple[list[s
 def encode_latents(
     vae,
     dataset,
-    preprocess,
     device: str,
+    resolution: int,
+    crop: bool,
+    crop_scale=(0.8, 1.0),
     batch_size: int = 16,
     scale: float = 0.18215,
     flip: bool = False,
     stochastic: bool = False,
     desc: str = "VAE encode",
-) -> torch.Tensor:
-    """One pass over the dataset through the VAE encoder. Returns (N, 4, S, S) on CPU."""
-    out = []
+):
+    """
+    One pass over the dataset through the VAE encoder.
+    Returns (latents (N,4,S,S) on CPU, views (N,5)).
+    """
+    out, views = [], []
     for i in tqdm(range(0, len(dataset), batch_size), desc=desc):
         batch = dataset[i : i + batch_size]
-        imgs = torch.stack([preprocess(im) for im in batch["image"]])
-        if flip:
-            imgs = torch.flip(imgs, dims=[-1])
-        imgs = imgs.to(device)
+        pairs = [crop_with_params(im, resolution, crop, crop_scale, flip=flip)
+                 for im in batch["image"]]
+        imgs = torch.stack([p[0] for p in pairs]).to(device)
+        views.extend(p[1] for p in pairs)
         with torch.no_grad():
             dist = vae.encode(imgs).latent_dist
             lat = (dist.sample() if stochastic else dist.mode()) * scale
         out.append(lat.cpu())  # .cpu() is critical — don't hoard on device
-    return torch.cat(out, dim=0)
+    return torch.cat(out, dim=0), torch.tensor(views, dtype=torch.float32)
 
 
 def encode_text(text_encoder, tokenizer, captions: list[str], device: str, batch_size: int = 32) -> torch.Tensor:
@@ -235,22 +271,25 @@ def main() -> None:
     vae.eval()
     vae.requires_grad_(False)
 
-    lat_chunks, group_ids, crop_ids, flip_ids = [], [], [], []
+    lat_chunks, view_chunks, group_ids, crop_ids, flip_ids = [], [], [], [], []
     for crop_i in range(args.crops):
         # Seed per crop pass so the geometry is reproducible across reruns.
         torch.manual_seed(args.seed + crop_i)
-        pre = build_preprocess(args.resolution, crop=crop_i > 0, scale=tuple(args.crop_scale))
         for flip in flips:
             tag = f"crop {crop_i}{' flipped' if flip else ''}"
-            lat_chunks.append(encode_latents(
-                vae, poke, pre, device, batch_size=args.vae_batch_size,
+            lat, vw = encode_latents(
+                vae, poke, device, args.resolution, crop=crop_i > 0,
+                crop_scale=tuple(args.crop_scale), batch_size=args.vae_batch_size,
                 flip=flip, stochastic=args.latent_sample, desc=tag,
-            ))
+            )
+            lat_chunks.append(lat)
+            view_chunks.append(vw)
             group_ids.append(torch.arange(n_images))
             crop_ids.append(torch.full((n_images,), crop_i))
             flip_ids.append(torch.full((n_images,), int(flip)))
 
     latents = torch.cat(lat_chunks, dim=0)
+    view_params = torch.cat(view_chunks, dim=0)
     group_ids = torch.cat(group_ids).long()
     crop_ids = torch.cat(crop_ids).long()
     flip_ids = torch.cat(flip_ids).long()
@@ -309,6 +348,9 @@ def main() -> None:
             "hflip": bool(args.hflip),
             "caption_variants": args.caption_variants,
             "normalized": not args.no_normalize,
+            "view_params": view_params,
+            "view_dim": VIEW_DIM,
+            "canonical_view": torch.tensor(CANONICAL_VIEW),
             "group_ids": group_ids,
             "crop_ids": crop_ids,
             "flip_ids": flip_ids,

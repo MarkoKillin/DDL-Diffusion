@@ -63,6 +63,7 @@ def _predict_with_cfg(
     uncond_emb: torch.Tensor,
     guidance_scale: float,
     guidance_rescale: float = 0.0,
+    view: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     One forward pass that batches uncond + cond together, then combines.
@@ -79,8 +80,9 @@ def _predict_with_cfg(
     x_in = torch.cat([x_t, x_t], dim=0)
     t_in = torch.cat([t, t], dim=0)
     ctx_in = torch.cat([uncond_emb, cond_emb], dim=0)
+    view_in = torch.cat([view, view], dim=0) if view is not None else None
 
-    both = model(x_in, t_in, ctx_in)
+    both = model(x_in, t_in, ctx_in, view_in)
     pred_uncond, pred_cond = both.chunk(2, dim=0)
 
     pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
@@ -120,6 +122,7 @@ def sample_ddpm(
     spacing: str = "trailing",
     clip_x0: float | None = None,
     x_T: torch.Tensor | None = None,
+    view: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
@@ -175,7 +178,8 @@ def sample_ddpm(
         is_last = i + 1 == len(timesteps)
         t = torch.full((B,), step.item(), device=device, dtype=torch.long)
 
-        pred = _predict_with_cfg(model, x, t, cond_emb, uncond_emb, guidance_scale, guidance_rescale)
+        pred = _predict_with_cfg(model, x, t, cond_emb, uncond_emb, guidance_scale,
+                                 guidance_rescale, view)
         x0_pred, _ = scheduler.to_x0_and_eps(pred, x, t)
         if clip_x0 is not None:
             x0_pred = x0_pred.clamp(-clip_x0, clip_x0)
@@ -217,6 +221,7 @@ def sample_ddim(
     spacing: str = "trailing",
     clip_x0: float | None = None,
     x_T: torch.Tensor | None = None,
+    view: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
@@ -256,7 +261,8 @@ def sample_ddim(
         is_last = i + 1 == len(timesteps)
         t = torch.full((B,), step.item(), device=device, dtype=torch.long)
 
-        pred = _predict_with_cfg(model, x, t, cond_emb, uncond_emb, guidance_scale, guidance_rescale)
+        pred = _predict_with_cfg(model, x, t, cond_emb, uncond_emb, guidance_scale,
+                                 guidance_rescale, view)
         x0_pred, eps_pred = scheduler.to_x0_and_eps(pred, x, t)
         if clip_x0 is not None:
             x0_pred = x0_pred.clamp(-clip_x0, clip_x0)
@@ -326,6 +332,7 @@ def sample_to_image(
     eta: float = 0.0,
     clip_x0: float | None = None,
     x_T: torch.Tensor | None = None,
+    view: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
@@ -336,7 +343,7 @@ def sample_to_image(
     common = dict(
         guidance_scale=guidance_scale, guidance_rescale=guidance_rescale,
         num_steps=num_steps, latent_shape=latent_shape, clip_x0=clip_x0,
-        x_T=x_T, generator=generator,
+        x_T=x_T, view=view, generator=generator,
     )
     if method == "ddim":
         latents = sample_ddim(model, scheduler, cond_emb, uncond_emb, eta=eta, **common)

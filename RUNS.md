@@ -6,66 +6,130 @@ said, and what to change next. See [`plan.md`](plan.md) for the design and
 
 ---
 
-## Run 3 — configured, not yet trained
+## Run 4 — configured, not yet trained
 
-Run 2's checkpoints were deleted, so this is a clean start. Run 2's diagnosis: **it fit,
-then memorized hard** — held-out loss finished 50% worse than predicting zero while 3 of 4
-samples were near-pixel copies of training images. The cause was arithmetic: 35.5M params
-against 1,500 × 4,096 = 6.1M training scalars, **5.8× more parameters than numbers in the
-dataset**. Run 3 moves that ratio ~12× by attacking both sides.
+Run 3's failure mode was fixed but the samples were blurry. Measured cause: augmenting each
+image into 8 views made **59.9% of the target variance unpredictable from the caption** —
+the model cannot know which framing it is being asked for, so an L2 objective is minimized
+by predicting the *average* of the 8 views, and decoding an average is blur.
 
-### Config
+| config | views/img | view noise |
+|---|---|---|
+| run 1 | 1 | 0.0% |
+| run 2 (flip) | 2 | 38.6% |
+| 4 crops, no flip | 4 | 38.8% |
+| **run 3** (4 crops + flip) | 8 | **59.9%** |
 
-| Knob | Run 2 | Run 3 | Why |
-|---|---|---|---|
-| Latents | 1,666 | **6,664** | 4 crops (scale 0.8–1.0) × 2 flips |
-| Caption variants | 1 | **2** | original + Pokemon name → "creature" |
-| Params | 35.5M | **17.4M** | `base_channels` 96 → 64 |
-| Params / training scalar | 5.78× | **0.71×** | the headline number |
-| Dropout | 0.0 | **0.1** | run 1's underfit justified 0; run 2 does not |
-| Weight decay | 0.01 | **0.05** | |
-| CFG dropout | 0.10 | **0.15** | |
-| Epochs | 600 | **150** | run 2's optimum was epoch ~55–100 of 600 |
-| Batch | 32 | 32 | → 187 batches/epoch, 28,050 steps |
-| Checkpoints | 12 × 569 MB | **`best.pt` 139 MB + `last.pt` 278 MB** | constant, not per-epoch |
-| GFLOP/forward | 7.97 | **3.69** | 2.2× faster per sample |
+Flip alone accounts for 38.6%, so trimming crops does not fix it. Run 4 keeps all 6,664
+latents and instead **conditions on the view**, the way SDXL's micro-conditioning does.
 
-Unchanged because they worked: 256px → 32×32 latents, per-channel normalization, zero
-terminal SNR, v-prediction, `min_snr_gamma=None`, LR 2e-4, EMA 0.9999, CFG 2.0 with
-`guidance_rescale=0.7`.
+### Changes
 
-### What changed in the code
+| Area | Change | Why |
+|---|---|---|
+| `unet.py` | `view_dim=5` → small MLP added to the time embedding, **zero-init** | turns the framing ambiguity into signal; +266k params; a fresh model behaves exactly as if absent |
+| `precompute.py` | `crop_with_params` records `[top, left, h, w, flip]` normalized; saved as `view_params` | run 3 discarded this information |
+| `train.py`/`sample.py` | `view` threaded through `diffusion_loss`, `train_step`, `validation_loss`, both samplers, `_predict_with_cfg` | at inference you request the canonical view `[0,0,1,1,0]` |
+| `EMA_DECAY` | 0.9999 → **0.999** | run 3's best checkpoint was epoch 34, where the 0.9999 ramp still lagged the live weights by 8% — itself a source of blur |
+| notebook | `MILESTONES = [30, 60, 100, 150]` slim snapshots | run 3 kept only best.pt + last.pt, and best.pt was the blurriest |
+| notebook | previews mix 3 training captions **+ 1 unseen prompt** | run 3's previews were training-only, so the generalization gap was invisible until eval |
+| notebook | no-text baseline (~0.84) computed and plotted inline | see finding 3 below |
+| notebook | `torch.quantile` → `kthvalue` | **the bug that killed run 3's entire eval section** |
 
-| Area | Change |
+Unchanged because they worked: 256px → 32×32, per-channel normalization, zero terminal SNR,
+v-prediction, `min_snr_gamma=None`, `base_channels=64`, dropout 0.1, weight decay 0.05,
+CFG dropout 0.15, caption variants, 4 crops + flip.
+
+### The honest tension
+
+Micro-conditioning makes the canonical view single-valued again, which is what buys
+sharpness — but it also removes some of the regularization that stopped run 3 memorizing.
+Watch the memorization cell. If nearest-train distances collapse toward run 2's 0.14–0.20×
+median, the sharpness came at the cost of copying.
+
+### What to watch
+
+1. Smoke-test first loss ≈ 1.0, and `view batch shape (32, 5)` printed beside it.
+2. **View noise printed by cell 10** — same 59.9%, but now conditioned on rather than averaged over.
+3. **The `stripped` column** — run 3 had it within 0.1% of `matched`. Keep it there.
+4. **Previews: the 4th image is an unseen prompt.** Run 3 got colour right and structure wrong.
+5. **Compare `best.pt` against the milestones BY EYE.** Lowest val MSE is the blurriest checkpoint.
+6. **`per-sample std` and `mean-spread`** — targets 0.987 and 0.122.
+7. **`t=975` held-out vs the no-text baseline** — run 3 scored +2.0%. This is the number that
+   says whether caption→layout generalizes at all.
+
+---
+
+## Run 3 — 2026-08-11 · 150 epochs · memorization fixed, samples blurry
+
+Full run on Colab. `base_channels=64` (17.4M params), 6,664 latents (4 crops × 2 flips),
+2 caption variants, dropout 0.1, weight decay 0.05, CFG dropout 0.15, batch 32,
+28,050 steps. `params-per-training-scalar` 0.71× (run 2: 5.78×).
+
+### Result
+
+**The failure mode is fixed.**
+
+| | Run 2 | Run 3 |
+|---|---|---|
+| Best held-out v-loss | ~0.62 | **0.5658** (epoch 34) |
+| Final held-out | 1.5157 | **0.6193** |
+| Train/val gap | +1.4077 | **+0.1148** |
+| Held-out above predict-zero | 14/20 timesteps | **0/20** |
+| Conditioning shape | `uncond` ≪ `shuffled` (lookup) | **`matched < uncond < shuffled`** ✓ |
+| Largest relative conditioning gap | 6702% | **81%** |
+
+Eval section crashed at cell 31 (`torch.quantile` element limit), so there are **no sample
+images, no CFG sweep and no memorization check** for this run.
+
+### Findings
+
+**1. Caption augmentation worked, cleanly.** `stripped` came within **0.1%** of `matched` at
+every timestep (0.4305 vs 0.4306, 0.5763 vs 0.5769). Removing the Pokemon name costs the
+model nothing — run 2's name-as-lookup-key habit is gone. And the ordering
+`matched < uncond < shuffled` now holds at every t, where run 2 had `uncond` 6× *better*
+than `shuffled`.
+
+**2. The "learned nothing" line is 0.84, not 1.0.** The optimal predictor knowing only the
+per-dim mean and variance of the training latents — no text at all — scores **0.8426** train
+/ **0.8404** held-out. Per-channel normalization zeroes the *channel* means but leaves the
+spatial mean pattern, so predicting the average latent already beats predicting zero. Every
+earlier "% of variance explained" figure judged against 1.0 was too generous.
+
+**3. Generalization is real at low t and absent at high t.** Against that 0.84 baseline:
+
+| band | held-out improvement |
 |---|---|
-| `precompute.py` | `--crops` (crop 0 = centre, rest random-resized), `--caption-variants` with `strip_pokemon_name`, `group_ids`/`crop_ids`/`flip_ids`/`caption_groups` index arrays |
-| `train.py` | `make_split` now splits on **group id**, so all crops+flips of one image stay together; `LatentCaptionDataset` joins latents to captions by group and samples a variant per `__getitem__`; `save_checkpoint(slim=True)` drops optimizer state; `load_checkpoint` refuses slim files |
-| notebook | `best.pt` written on every held-out improvement; `last.pt` for resume; checkpoint-sweep cell; `stripped` column in the conditioning probe; 3-way `latent_stats`; `CFG_IMAGE = 1` |
+| t = 25–225 (texture) | **+45% to +60%** |
+| t = 425–575 | +25% to +43% |
+| t = 725–975 (caption → layout) | **+2% to +9%** |
 
-Caption augmentation detail: the name-stripping heuristic (non-initial capitalised word,
-excluding the franchise word, qualifiers like "Forme"/"Legendary", and anything hyphenated so
-"Water-type" survives) fires on **62% of the 833 captions**, and 442 of the words it finds are
-singletons — i.e. actual names. Storage stays flat because captions are held once per
-(image, variant) and joined by group id rather than duplicated across the 8 views.
+Mean: train +45.8%, held-out +32.0%. But at t=975 — where the input carries zero information
+and only the caption remains — held-out is 0.8029 against a 0.8191 floor, i.e. **+2.0%**
+(train +28.8%). So the caption→layout mapping barely transfers. This predicts exactly what
+run 2's samples showed: correct colour, generic global shape.
 
-### What to watch, in order
+**4. 4× more data bought little, because crops add geometry not concepts.** Best held-out
+moved only 0.62 → 0.566. For the high-t task the effective dataset is still **750 distinct
+caption→image pairs** — the 8 views share one caption. Measured: two views of the same
+Pokemon sit at latent distance 68.7 vs 80.6 for two *different* Pokemon (ratio 0.85), so the
+views are not redundant, they just carry no new concepts. **Number of distinct images is now
+the binding constraint.**
 
-1. **Smoke-test first loss ≈ 1.0.** Anything else means the latents are not normalized.
-2. **`params-per-training-scalar` printed by the loader** — should read ~0.71×, not 5.78×.
-3. **The held-out curve.** If it rises again, the run is done — stop it; `best.pt` already
-   holds the good weights.
-4. **The `stripped` column in the conditioning probe.** Close to `matched` means the model
-   is reading the *description*; collapsing toward `uncond` means it is still keying on the
-   name. This is the single most informative new number in run 3.
-5. **`per-sample std` and `mean-spread`** from `latent_stats` (finding 11) — targets 0.987
-   and 0.122.
-6. **Novel prompts.** Run 2 got colour right and structure wrong on all four. Any structure
-   here is the real win.
-7. **Memorization cell:** want ~1.0× median and a train/held-out ratio near 1.0, against
-   run 2's 0.14–0.20× and 0.345.
+**5. The augmentation is what made the samples blurry.** See the run-4 section above: 59.9%
+of the target variance became unpredictable from the caption.
 
-Not yet done, in reserve if run 3 underfits: 2 downsamples instead of 3 (the 32×32
-bottleneck is 4×4 vs SD's 8×8).
+**6. Early stopping on val MSE selects for blur.** MSE is minimized by predicting the
+conditional *mean*, so the lowest-val-MSE checkpoint is systematically the smoothest.
+`best.pt` was epoch 34 of 150; `last.pt` fit far better (train 0.386 vs 0.468) at only 9%
+worse val. Use val loss to detect divergence, then choose between survivors by eye.
+
+**7. EMA lag added blur.** `‖ema−live‖/‖live‖ = 0.0807` at epoch 34, vs run 2's 0.0059 at
+epoch 600 — early in training the weights move fast and a 0.9999 decay cannot keep up.
+
+**8. The memorization threshold is now blunt.** Same-image different-view distance (68.7)
+exceeds the p1 of different images (66.9), so latent L2 can no longer sharply separate "copy
+at a different crop" from "distinct image".
 
 ---
 
