@@ -1,28 +1,34 @@
 """
-One-off pre-computation: encode the Pokemon dataset to latents + text embeddings.
+Helpers for turning the Pokemon dataset into latents and caption embeddings.
 
-Run this ONCE. Saves four files to disk that the training loop loads at startup:
-    latents.pt           (N_lat, 4, S, S)   — VAE-encoded crops, PER-CHANNEL NORMALIZED
-    latent_stats.pt      dict               — mean/std, index arrays, run metadata
-    embeddings.pt        (N_cap, 77, 768)   — CLIP-encoded caption variants
-    uncond_embedding.pt  (1, 77, 768)       — CLIP-encoded "" (for CFG)
+The notebook (`diffuser.ipynb`) owns the actual encoding pipeline — it needs the
+intermediate tensors in memory to report view noise and preview the crops, so running the
+pipeline twice (here and there) only creates two things that can drift apart. This module
+holds the pure functions both the notebook and the training code import:
 
-Frees the VAE and text encoder from VRAM during training.
+    VIEW_DIM, CANONICAL_VIEW    the micro-conditioning vector's shape and its identity value
+    build_preprocess            resize/crop transform, for display
+    crop_with_params            crop AND return the box, so the geometry can be conditioned on
+    strip_pokemon_name          caption variant 1: the proper name replaced by "creature"
+    build_caption_variants      flat caption list + the group id each caption belongs to
+    normalize_per_channel       per-channel zero-mean unit-std, SD3/Flux style
 
-Usage:
-    python code/precompute.py --out-dir code/ --resolution 256 --crops 4 --hflip
+Design notes, kept because the reasons are not obvious from the code:
 
-Changes since run 2, and why (see RUNS.md run-2 findings):
-
-  --crops K  (new)
+  Crops (`crop_with_params` with crop=True)
       Run 2 memorized hard: held-out loss ended 50% WORSE than predicting zero, and 3 of
-      4 samples were near-pixel copies of training images. Root cause was arithmetic —
-      35.5M params against 1,500 x 4,096 = 6.1M training scalars, i.e. 5.8x more
-      parameters than numbers in the dataset. K random-resized crops per image multiply
-      the data K-fold for one extra VAE pass each. Crop 0 is always the deterministic
-      centre crop, so the canonical view is guaranteed present.
+      4 samples were near-pixel copies of training images. The cause was arithmetic —
+      35.5M parameters against 1,500 x 4,096 = 6.1M training scalars. K random-resized
+      crops per image multiply the data K-fold for one extra VAE pass each. Crop 0 is
+      always the deterministic centre crop, so the canonical view is guaranteed present.
 
-  --caption-variants  (new)
+  The view vector
+      Run 3 threw the crop geometry away, which made 59.9% of its target variance
+      unpredictable from the caption, and the model answered by producing blurry averages.
+      Recording `[top, left, height, width, flip]` and feeding it to the U-Net as
+      micro-conditioning (SDXL-style) is what fixed that in run 4.
+
+  Caption variants (`strip_pokemon_name`)
       Run 2's model keyed on the Pokemon NAME as a lookup token: shuffling captions cost
       it 68x the matched loss, while the empty caption cost only 11x. Given no caption it
       produced something generic and sane; given a WRONG one it confidently produced the
@@ -32,32 +38,17 @@ Changes since run 2, and why (see RUNS.md run-2 findings):
 
   Latents and captions are stored SEPARATELY, joined by group id
       A 77x768 embedding is 237 KB; duplicating it per crop would dominate the output
-      (K=4 + flip would push embeddings.pt past 1.5 GB). Instead latents carry a
+      (K=4 plus flips would push embeddings.pt past 1.5 GB). Instead latents carry a
       `group_ids` array naming their source image, captions carry `caption_groups`, and
       train.LatentCaptionDataset joins them — picking a random variant per __getitem__,
       which makes the caption augmentation free and per-epoch.
-
-  Per-channel normalization and zero-terminal-SNR were run 2's wins and are unchanged.
 """
 
 from __future__ import annotations
 
-import argparse
-import re
-from pathlib import Path
-
 import torch
 from torchvision import transforms as T
 from torchvision.transforms import functional as TF
-from tqdm import tqdm
-
-
-def pick_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 # Image preprocessing
@@ -81,7 +72,7 @@ def build_preprocess(resolution: int = 256, crop: bool = False, scale=(0.8, 1.0)
 
     Both end at [-1, 1], which is what the SD VAE expects.
 
-    Kept for the notebook's preview of what the crops look like. The encoding path uses
+    Used for display and for decoding comparisons. The encoding path uses
     crop_with_params below, which returns the box alongside the tensor.
     """
     if crop:
@@ -95,8 +86,7 @@ def crop_with_params(img, resolution: int, crop: bool, scale=(0.8, 1.0), ratio=(
                      flip: bool = False):
     """
     Returns (tensor in [-1,1], view vector) so the crop geometry can be recorded and used
-    as conditioning. Run 3 threw this information away, which is why 59.9% of its target
-    variance was unpredictable from the caption.
+    as conditioning.
     """
     W, H = img.size
     if crop:
@@ -164,57 +154,6 @@ def build_caption_variants(captions: list[str], n_variants: int) -> tuple[list[s
     return flat, torch.tensor(groups, dtype=torch.long)
 
 
-# Encoding
-def encode_latents(
-    vae,
-    dataset,
-    device: str,
-    resolution: int,
-    crop: bool,
-    crop_scale=(0.8, 1.0),
-    batch_size: int = 16,
-    scale: float = 0.18215,
-    flip: bool = False,
-    stochastic: bool = False,
-    desc: str = "VAE encode",
-):
-    """
-    One pass over the dataset through the VAE encoder.
-    Returns (latents (N,4,S,S) on CPU, views (N,5)).
-    """
-    out, views = [], []
-    for i in tqdm(range(0, len(dataset), batch_size), desc=desc):
-        batch = dataset[i : i + batch_size]
-        pairs = [crop_with_params(im, resolution, crop, crop_scale, flip=flip)
-                 for im in batch["image"]]
-        imgs = torch.stack([p[0] for p in pairs]).to(device)
-        views.extend(p[1] for p in pairs)
-        with torch.no_grad():
-            dist = vae.encode(imgs).latent_dist
-            lat = (dist.sample() if stochastic else dist.mode()) * scale
-        out.append(lat.cpu())  # .cpu() is critical — don't hoard on device
-    return torch.cat(out, dim=0), torch.tensor(views, dtype=torch.float32)
-
-
-def encode_text(text_encoder, tokenizer, captions: list[str], device: str, batch_size: int = 32) -> torch.Tensor:
-    """Run all captions through CLIP. Returns (N, 77, 768) on CPU."""
-    all_ids = tokenizer(
-        captions,
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
-    ).input_ids
-
-    chunks = []
-    for i in tqdm(range(0, len(captions), batch_size), desc="CLIP encode"):
-        ids = all_ids[i : i + batch_size].to(device)
-        with torch.no_grad():
-            emb = text_encoder(ids).last_hidden_state
-        chunks.append(emb.cpu())
-    return torch.cat(chunks, dim=0)
-
-
 def normalize_per_channel(latents: torch.Tensor):
     """
     Returns (normalized, mean, std) with mean/std shaped (1, C, 1, 1).
@@ -227,156 +166,3 @@ def normalize_per_channel(latents: torch.Tensor):
     mean = latents.mean(dim=(0, 2, 3), keepdim=True)
     std = latents.std(dim=(0, 2, 3), keepdim=True)
     return (latents - mean) / std, mean, std
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="diffusers/pokemon-gpt4-captions")
-    ap.add_argument("--vae", default="stabilityai/sd-vae-ft-mse")
-    ap.add_argument("--clip", default="openai/clip-vit-large-patch14")
-    ap.add_argument("--out-dir", default="code")
-    ap.add_argument("--resolution", type=int, default=256, help="image side in pixels; latents are /8")
-    ap.add_argument("--crops", type=int, default=4, help="crops per image; crop 0 is the centre crop")
-    ap.add_argument("--crop-scale", type=float, nargs=2, default=(0.8, 1.0))
-    ap.add_argument("--hflip", action="store_true", help="also encode horizontally flipped views")
-    ap.add_argument("--caption-variants", type=int, default=2, help="1 = original only, 2 = + name-stripped")
-    ap.add_argument("--latent-sample", action="store_true", help="sample the VAE posterior instead of its mode")
-    ap.add_argument("--no-normalize", action="store_true", help="skip per-channel normalization")
-    ap.add_argument("--seed", type=int, default=0, help="seeds the random crops, for reproducibility")
-    ap.add_argument("--vae-batch-size", type=int, default=16)
-    ap.add_argument("--clip-batch-size", type=int, default=32)
-    args = ap.parse_args()
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    device = pick_device()
-    print(f"device: {device}")
-
-    # Deferred imports — these are heavy and not needed elsewhere.
-    import datasets
-    from diffusers import AutoencoderKL
-    from transformers import CLIPTokenizer, CLIPTextModel
-
-    print(f"loading dataset {args.dataset}")
-    poke = datasets.load_dataset(args.dataset)["train"]
-    captions = [row["text"] for row in poke]
-    n_images = len(poke)
-    flips = (False, True) if args.hflip else (False,)
-    print(f"dataset size: {n_images}   crops: {args.crops}   flips: {len(flips)}   "
-          f"-> {n_images * args.crops * len(flips)} latents")
-
-    print(f"loading VAE {args.vae}")
-    vae = AutoencoderKL.from_pretrained(args.vae).to(device)
-    vae.eval()
-    vae.requires_grad_(False)
-
-    lat_chunks, view_chunks, group_ids, crop_ids, flip_ids = [], [], [], [], []
-    for crop_i in range(args.crops):
-        # Seed per crop pass so the geometry is reproducible across reruns.
-        torch.manual_seed(args.seed + crop_i)
-        for flip in flips:
-            tag = f"crop {crop_i}{' flipped' if flip else ''}"
-            lat, vw = encode_latents(
-                vae, poke, device, args.resolution, crop=crop_i > 0,
-                crop_scale=tuple(args.crop_scale), batch_size=args.vae_batch_size,
-                flip=flip, stochastic=args.latent_sample, desc=tag,
-            )
-            lat_chunks.append(lat)
-            view_chunks.append(vw)
-            group_ids.append(torch.arange(n_images))
-            crop_ids.append(torch.full((n_images,), crop_i))
-            flip_ids.append(torch.full((n_images,), int(flip)))
-
-    latents = torch.cat(lat_chunks, dim=0)
-    view_params = torch.cat(view_chunks, dim=0)
-    group_ids = torch.cat(group_ids).long()
-    crop_ids = torch.cat(crop_ids).long()
-    flip_ids = torch.cat(flip_ids).long()
-
-    print(f"\nlatents: {tuple(latents.shape)}  (raw, before normalization)")
-    raw_stats = {
-        "overall_mean": latents.mean().item(),
-        "overall_std": latents.std().item(),
-        "per_channel_mean": latents.mean(dim=(0, 2, 3)).tolist(),
-        "per_channel_std": latents.std(dim=(0, 2, 3)).tolist(),
-    }
-    print(f"  per-channel mean {[round(v, 3) for v in raw_stats['per_channel_mean']]}")
-    print(f"  per-channel std  {[round(v, 3) for v in raw_stats['per_channel_std']]}")
-
-    if args.no_normalize:
-        lat_mean = torch.zeros(1, latents.shape[1], 1, 1)
-        lat_std = torch.ones(1, latents.shape[1], 1, 1)
-    else:
-        latents, lat_mean, lat_std = normalize_per_channel(latents)
-        print(f"  normalized -> mean {latents.mean().item():+.5f}  std {latents.std().item():.4f}  "
-              f"abs max {latents.abs().max().item():.2f}")
-
-    torch.save(latents, out_dir / "latents.pt")
-
-    # Free VAE VRAM before loading CLIP.
-    del vae
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    print(f"loading CLIP {args.clip}")
-    tokenizer = CLIPTokenizer.from_pretrained(args.clip)
-    text_encoder = CLIPTextModel.from_pretrained(args.clip).to(device)
-    text_encoder.eval()
-    text_encoder.requires_grad_(False)
-
-    flat_captions, caption_groups = build_caption_variants(captions, args.caption_variants)
-    n_changed = sum(1 for c in captions if strip_pokemon_name(c)[1])
-    if args.caption_variants > 1:
-        print(f"caption variants: {args.caption_variants} per image "
-              f"({n_changed}/{n_images} had a name to strip)")
-    embeddings = encode_text(text_encoder, tokenizer, flat_captions, device, batch_size=args.clip_batch_size)
-    print(f"embeddings: {tuple(embeddings.shape)}")
-    torch.save(embeddings, out_dir / "embeddings.pt")
-
-    torch.save(
-        {
-            "mean": lat_mean,
-            "std": lat_std,
-            "scale": 0.18215,
-            "resolution": args.resolution,
-            "latent_size": latents.shape[-1],
-            "latent_channels": latents.shape[1],
-            "n_images": n_images,
-            "crops": args.crops,
-            "crop_scale": tuple(args.crop_scale),
-            "hflip": bool(args.hflip),
-            "caption_variants": args.caption_variants,
-            "normalized": not args.no_normalize,
-            "view_params": view_params,
-            "view_dim": VIEW_DIM,
-            "canonical_view": torch.tensor(CANONICAL_VIEW),
-            "group_ids": group_ids,
-            "crop_ids": crop_ids,
-            "flip_ids": flip_ids,
-            "caption_groups": caption_groups,
-            "vae": args.vae,
-            "seed": args.seed,
-            "raw_stats": raw_stats,
-        },
-        out_dir / "latent_stats.pt",
-    )
-
-    # Uncond embedding: CLIP encoding of "".
-    uncond_ids = tokenizer(
-        "",
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
-    ).input_ids.to(device)
-    with torch.no_grad():
-        uncond = text_encoder(uncond_ids).last_hidden_state.cpu()
-    print(f"uncond_embedding: {tuple(uncond.shape)}")
-    torch.save(uncond, out_dir / "uncond_embedding.pt")
-
-    print("done.")
-
-
-if __name__ == "__main__":
-    main()

@@ -14,25 +14,30 @@ See [`plan.md`](plan.md) for the full design doc and math derivation. The Jupyte
 | `code/unet.py` | `UNet` — the only thing being trained. ResNet + self/cross-attention, 3 down/up stages. Resolution-agnostic; width and depth are constructor args |
 | `code/train.py` | EMA, optimizer/LR factories, AMP selection, CFG dropout, leakage-safe split, `train_step`, `validation_loss`, checkpoint save/load |
 | `code/sample.py` | `sample_ddpm` (faithful) and `sample_ddim` (fast). Both do CFG with optional guidance rescale, and work with either prediction type |
-| `code/precompute.py` | CLI: encode dataset → `latents.pt` / `latent_stats.pt` / `embeddings.pt` / `uncond_embedding.pt` |
-| `code/diffuser.ipynb` | The walkthrough notebook |
+| `code/precompute.py` | Crop/caption/normalization helpers the notebook imports — crop geometry recording, caption variants, per-channel stats |
+| `code/diffuser.ipynb` | The walkthrough notebook, and the pipeline itself |
 | `RUNS.md` | Training run log: config, results, findings, next actions |
 
-The four `.pt` tensor files are not committed (see `.gitignore`); regenerate them with `precompute.py`.
+The four `.pt` tensor files are not committed (see `.gitignore`). Regenerate them by
+running the notebook's encoding cells, which write `latents.pt`, `latent_stats.pt`,
+`embeddings.pt` and `uncond_embedding.pt` into `code/`.
 
 ## How to reproduce
 
 ```bash
 uv sync                                            # install deps
-python code/precompute.py --out-dir code/ \
-    --resolution 256 --hflip                       # one-off: encode dataset → .pt files
 ```
+
+Then run [`code/diffuser.ipynb`](code/diffuser.ipynb) top to bottom. The encoding cells are
+the one-off step: they pull the dataset, run the VAE and CLIP over it, and save the four
+`.pt` files. Everything after that loads those files, so you can restart the kernel and
+jump straight to training without re-encoding.
 
 `latents.pt` is **per-channel normalized** (zero mean, unit std per channel); `latent_stats.pt`
 holds the mean/std needed to undo that before `vae.decode`, plus the resolution and
 augmentation metadata. Pass them to `latents_to_images` — skipping them decodes grey mush.
 
-`--preview` in the notebook decodes a DDIM sample every N epochs. Use it: the loss curve
+`PREVIEW` in the notebook decodes a DDIM sample every N epochs. Use it: the loss curve
 alone is a poor signal for diffusion quality, and run 1 spent 200 epochs proving it.
 
 ## Notes on the design
