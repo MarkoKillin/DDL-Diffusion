@@ -9,27 +9,19 @@ unconditional predictions through one forward pass, then combines them as
     pred = pred_uncond + w * (pred_cond - pred_uncond)
 The model itself is unchanged — CFG lives entirely in the sampler.
 
-Changes since run 1, and why:
+Three things to know:
 
-  Both samplers now go through scheduler.to_x0_and_eps()
-      so they work with prediction_type="eps" or "v" without knowing which.
+  Both samplers go through scheduler.to_x0_and_eps(), so they work with
+  prediction_type="eps" or "v" without knowing which.
 
-  DDPM is written in x_0-posterior form rather than the eps shortcut
-      The old form computed mean = (1/sqrt(alpha_eff)) * (...), which divides by
-      zero on the first step when zero_terminal_snr makes alphas_cumprod[t] = 0.
-      The posterior form is finite everywhere and is algebraically identical on
-      the full 1000-step grid.
+  DDPM is written in x_0-posterior form rather than the eps shortcut. The eps form computes
+  mean = (1/sqrt(alpha_eff)) * (...), which divides by zero on the first step when
+  zero_terminal_snr makes alphas_cumprod[t] = 0. The posterior form is finite everywhere
+  and algebraically identical on the full 1000-step grid.
 
-  guidance_rescale (Lin et al. section 3.4)
-      Run 1's measured latent statistics showed CFG inflating the standard
-      deviation well past the training data's (std 1.30 at w=7.5 vs 1.12 in the
-      data) while INVERTING the per-channel mean pattern (Pearson r vs the data's
-      channel means: +0.83 at w=1.0, -0.63 at w=7.5). Rescaling the guided
-      prediction back to the conditional prediction's std counteracts that.
-
-  latent_shape is a parameter
-      Run 1 hardcoded randn(B, 4, 64, 64) in both samplers, which silently
-      blocked training at any other resolution.
+  guidance_rescale (Lin et al. section 3.4) counteracts high guidance inflating the latent
+  standard deviation and distorting the per-channel mean pattern, by rescaling the guided
+  prediction back to the conditional prediction's standard deviation.
 """
 
 from __future__ import annotations
@@ -46,8 +38,8 @@ def _apply_guidance_rescale(pred_cfg: torch.Tensor, pred_cond: torch.Tensor, phi
     Lin et al. section 3.4. Rescale the guided prediction so its per-sample standard
     deviation matches the plain conditional prediction, then blend by phi.
 
-    phi=0.0 is plain CFG; phi=0.7 is the paper's recommendation. Attacks the
-    over-exposure / over-saturation that high guidance causes.
+    phi=0.0 is plain CFG; phi=0.7 is the paper's recommendation. Counteracts the
+    over-exposure and over-saturation that high guidance causes.
     """
     dims = tuple(range(1, pred_cfg.ndim))
     std_cond = pred_cond.std(dim=dims, keepdim=True)
@@ -95,10 +87,8 @@ def _init_latents(B, latent_shape, device, generator, x_T=None):
     """
     Starting noise. Pass x_T to control it explicitly.
 
-    Any test that compares PROMPTS must hold the starting noise fixed across rows —
-    otherwise the difference between two samples is mostly the noise draw. Run 1's
-    "prompt-independent collapse" check drew fresh noise per row, so its pairwise
-    latent distances measured nothing about the prompt.
+    Comparing prompts means holding the starting noise fixed across rows; otherwise the
+    difference between two samples is mostly the noise draw.
     """
     if x_T is not None:
         expected = (B, *latent_shape)
@@ -151,13 +141,13 @@ def sample_ddpm(
         guidance_rescale : phi in Lin et al. section 3.4. 0.0 disables.
         num_steps        : denoising steps; defaults to scheduler.T (the full 1000).
         latent_shape     : (C, H, W) of the latents — must match what was trained on.
-        clip_x0          : if set, clamp each x_0 estimate to [-clip_x0, clip_x0].
-                           Cheap guard against high guidance running away. Pick it
-                           from the training latents' actual range, not from 1.0.
+        clip_x0          : if set, clamp each x_0 estimate to [-clip_x0, clip_x0]. Cheap
+                           guard against high guidance running away. Take it from the
+                           training latents' actual range.
         generator        : torch.Generator for reproducible sampling
 
     Returns:
-        (B, C, H, W) latents in the SAME normalized space the model trained on.
+        (B, C, H, W) latents in the same normalized space the model trained on.
         Pass through latents_to_images (with the saved lat_mean / lat_std) to decode.
     """
     model.eval()
@@ -235,10 +225,9 @@ def sample_ddim(
     x0_pred and eps_pred come from the scheduler, so this works for eps- and
     v-prediction alike. With eta=0 the stochastic term drops entirely.
 
-    Worth knowing: run 1's diagnostics showed DDIM at eta=0 drifting toward the
-    conditional mean (per-channel means 13-27% of the data's spread) while DDPM-1000
-    tracked the data far better (38%, r=+0.88). If DDIM samples look flat, try
-    eta=1.0 before assuming the model is at fault.
+    The deterministic eta=0 trajectory tends to drift toward the conditional mean, where
+    DDPM-1000 tracks the data more closely. If DDIM samples look flat, try eta=1.0 before
+    assuming the model is at fault.
 
     Args as sample_ddpm, plus:
         num_steps : how many denoising steps (typically 25-100)
@@ -306,7 +295,7 @@ def latents_to_images(
         scale    : the 0.18215 SD scaling factor — we divide before decoding.
 
     If lat_mean / lat_std are given, the per-channel normalization is undone first.
-    Skipping them on latents that WERE normalized decodes grey mush, so pass them.
+    Skipping them on normalized latents decodes grey mush.
     """
     lat = latents
     if lat_mean is not None and lat_std is not None:

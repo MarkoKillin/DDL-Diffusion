@@ -1,32 +1,29 @@
 """
-Noise schedule + forward (q_sample) for the diffusion process.
+Noise schedule and forward process for diffusion. Deterministic math, no learned weights.
 
-Owns the precomputed schedule constants, the one-shot forward noising function,
-the prediction-target conversions, and the loss weighting. Not a neural net —
-just deterministic math.
+Holds the precomputed schedule constants, q_sample, the prediction-target conversions and
+the loss weighting.
 
-Two knobs matter a lot and are new since run 1:
+Two options matter:
 
   zero_terminal_snr
-      Run 1 had alphas_cumprod[-1] = 0.00158, so sqrt(alphas_cumprod[-1]) = 0.0397
-      and training at t=999 still leaked 0.0397 * x_0 into x_t. The model learned to
-      READ the output's DC level off that leak instead of GENERATING it. At inference
-      x_T = randn has exactly zero per-channel mean, the cue is gone, and every
-      channel collapses toward a common value. Rescaling so alphas_cumprod[-1] = 0
-      removes the leak (Lin et al., "Common Diffusion Noise Schedules and Sample
-      Steps are Flawed", Algorithm 1).
+      Rescales the betas so alphas_cumprod[-1] is exactly 0 (Lin et al., "Common Diffusion
+      Noise Schedules and Sample Steps are Flawed", Algorithm 1). Without it the last
+      timestep still mixes a little x_0 into x_t, so the model can read the output's
+      brightness off its input instead of generating it. At inference x_T = randn carries
+      no such cue, and the channels collapse toward a common value.
 
   prediction_type
-      "eps" is the classic DDPM parameterization and what plan.md derives.
+      "eps" predicts the noise: the classic DDPM parameterization, and what plan.md derives.
       "v" predicts the velocity v = sqrt(ab) * eps - sqrt(1-ab) * x_0.
-      v is REQUIRED when zero_terminal_snr=True: at ab=0 the eps route needs
-      x_0 = (x_t - sqrt(1-ab) eps) / sqrt(ab), which divides by zero. The v route
-      is x_0 = sqrt(ab) x_t - sqrt(1-ab) v, which is finite everywhere.
 
-      v also fixes the loss weighting for free. Since ||v - v_hat||^2 equals
-      ||eps - eps_hat||^2 / alphas_cumprod, and the Bayes-optimal eps loss is
-      ~alphas_cumprod for unit-variance data, v-loss is roughly flat across t.
-      Run 1's unweighted eps loss put 91% of its magnitude in t < 500.
+      v is required when zero_terminal_snr=True. Recovering x_0 from eps needs
+      (x_t - sqrt(1-ab) eps) / sqrt(ab), which divides by zero at ab=0; the v route
+      x_0 = sqrt(ab) x_t - sqrt(1-ab) v is finite everywhere.
+
+      v also balances the loss across timesteps for free. ||v - v_hat||^2 equals
+      ||eps - eps_hat||^2 / alphas_cumprod, and the Bayes-optimal eps loss is about
+      alphas_cumprod for unit-variance data, so v-loss is roughly flat in t.
 """
 
 import math
@@ -60,12 +57,11 @@ def rescale_betas_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     """
     Lin et al. 2023, Algorithm 1.
 
-    Shifts and scales sqrt(alphas_cumprod) so that its last entry is exactly 0 while
-    its first entry is unchanged. Result: x_T is pure noise with no residual signal,
-    which is what inference actually samples from.
+    Shifts and scales sqrt(alphas_cumprod) so its last entry is exactly 0 and its first is
+    unchanged, leaving x_T as pure noise with no residual signal.
 
-    Side effect worth knowing: betas[-1] becomes 1.0. That is expected, not a bug —
-    the final forward step destroys all remaining signal by construction.
+    betas[-1] becomes 1.0 as a result. That is expected: the final forward step destroys
+    all remaining signal by construction.
     """
     ab = torch.cumprod(1.0 - betas, dim=0)
     sqrt_ab = ab.sqrt()
@@ -82,16 +78,15 @@ def make_timesteps(T: int, num_steps: int, device, spacing: str = "trailing") ->
     """
     Decreasing timestep grid of length num_steps.
 
-    Sampling MUST include the highest timestep, where the schedule expects pure noise —
-    which is what we initialize x to. Fewer steps means a COARSER STRIDE over the whole
-    schedule, not a shorter walk through its low-noise tail.
+    The grid must include the highest timestep, where the schedule expects the pure noise
+    we initialize x to. Fewer steps means a coarser stride over the whole schedule, not a
+    shorter walk through its low-noise tail.
 
-      "trailing" : Lin et al.'s recommendation. round(arange(T, 0, -T/n)) - 1, so the
-                   grid starts at exactly T-1. Ends at T/n - 1 rather than 0; the
-                   samplers set alpha_bar_prev = 1 on the final step, so x still lands
-                   on x_0.
-      "linspace" : evenly spaced from T-1 down to 0. What run 1 used. Also starts at
-                   T-1, so it never had the "leading" bug Lin et al. describe.
+      "trailing" : Lin et al.'s recommendation. round(arange(T, 0, -T/n)) - 1, so the grid
+                   starts at exactly T-1. It ends at T/n - 1 rather than 0; the samplers
+                   set alpha_bar_prev = 1 on the final step, so x still lands on x_0.
+      "linspace" : evenly spaced from T-1 down to 0. Also starts at T-1, so it avoids the
+                   "leading" bug Lin et al. describe.
     """
     if num_steps >= T:
         return torch.arange(T - 1, -1, -1, device=device)
@@ -134,8 +129,7 @@ class NoiseScheduler(nn.Module):
             raise ValueError(
                 "zero_terminal_snr=True is incompatible with prediction_type='eps': at "
                 "alphas_cumprod=0 the x_0 estimate (x_t - sqrt(1-ab) eps) / sqrt(ab) divides "
-                "by zero. Use prediction_type='v', or set zero_terminal_snr=False to "
-                "reproduce run 1."
+                "by zero. Use prediction_type='v', or set zero_terminal_snr=False."
             )
 
         betas = make_betas(T, beta_start, beta_end, schedule)
@@ -213,18 +207,18 @@ class NoiseScheduler(nn.Module):
         """
         Per-sample loss weight, shaped (B,). None (the default) means unweighted.
 
-        For prediction_type="v", UNWEIGHTED IS ALREADY THE BALANCED OBJECTIVE. At the
-        Bayes optimum the v-loss is 1.0 at every t, so the training signal is spread
-        uniformly per timestep. Run 1's unweighted eps-loss instead equalled alpha_bar_t,
-        which put 31.5% of the signal below t=100 and 0.3% above t=750.
+        For prediction_type="v" unweighted is already the balanced objective: at the Bayes
+        optimum the v-loss is 1.0 at every t, so the signal is spread evenly across
+        timesteps. Unweighted eps-loss instead equals alpha_bar_t, which concentrates it
+        at low noise.
 
         min_snr_gamma applies Min-SNR-gamma (Hang et al. 2023):
             eps : min(SNR, gamma) / SNR
             v   : min(SNR, gamma) / (SNR + 1)
-        It is the right tool for eps-prediction. On top of v-prediction it peaks where
-        SNR = gamma (alpha_bar = gamma/(1+gamma), so t~116 for gamma=5 on this schedule)
-        and decays in both directions — which puts the emphasis BACK on low noise, the
-        opposite of what run 1 needed. Left in for experiments; leave it None for v.
+        It is the right tool for eps-prediction. On top of v it peaks where SNR = gamma
+        (alpha_bar = gamma/(1+gamma), so t~116 for gamma=5 here) and decays in both
+        directions, putting the emphasis back on low noise. Leave it None for v; it is
+        here for experiments.
         """
         if min_snr_gamma is None:
             return torch.ones_like(self.alphas_cumprod[t])

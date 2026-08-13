@@ -11,45 +11,34 @@ Components (bottom-up):
   - SelfAttention                        : every spatial position attends to every other
   - CrossAttention                       : image queries text — how prompts steer generation
   - Downsample / Upsample                : strided conv / NN-interp + conv
-  - DownStage / UpStage                  : ResNet(s) + SelfAttn + CrossAttn group
+  - Stage                                : ResNet(s) + SelfAttn + CrossAttn group
   - UNet                                 : full assembly with skip connections
 
-Changes since run 1, and why:
+Constructor options:
 
-  top_self_attn=False (was: always on)
-      Self-attention over the highest-resolution feature map was 44.2% of the
-      forward pass (two layers out of ~28) because it attends over H*W tokens:
-      4096 at 64x64 vs 1024 at 32x32 vs 256 at 16x16. Stable Diffusion has no
-      attention at its highest resolution for exactly this reason. Cross-attention
-      is kept there — it is only 0.8% and it is how text reaches full resolution.
+  top_self_attn=False
+      Self-attention attends over H*W tokens — 4096 at 64x64 against 1024 at 32x32 and 256
+      at 16x16 — so at the highest resolution it was 44% of the forward pass. Stable
+      Diffusion has none there either. Cross-attention stays: under 1% of the cost, and it
+      is how text reaches full resolution.
 
-  num_res_blocks=2 (was: 1)
-      DDPM and SD use 2+. One block per stage left the skip connections dominating
-      and gave the network very little depth to compute with.
+  num_res_blocks=2
+      DDPM and SD use 2 or more. One block per stage leaves the skip connections dominating
+      and gives the network little depth to compute with.
 
-  dropout=0.0 (was: 0.1)
-      Run 1 was underfitting by a wide margin — it fit its own training set worse
-      than a closed-form Gaussian projection. Dropout on an underfitting model is
-      pure damage, and it also inflated every logged training loss.
+  view_dim
+      SDXL-style micro-conditioning on the crop box and flip flag. With several augmented
+      views per image the caption does not say which framing is wanted, so part of the
+      target is unpredictable and an L2-trained model answers by predicting the average of
+      the views — which decodes as blur. Passing the view makes the mapping single-valued;
+      at inference you request the canonical view. The projection is zero-initialised, so a
+      fresh model behaves as if the conditioning were absent.
 
-  view_dim  (new in run 4)
-      SDXL-style micro-conditioning. Run 3 augmented each image into 8 views (4 crops x
-      2 flips) and measured that 59.9% of the target variance became UNPREDICTABLE from
-      the caption — the model cannot know which framing it is being asked for. An
-      L2-trained model resolves that by predicting the average of the 8 views, and
-      decoding an average is exactly what a blurry sample looks like. Flip alone
-      accounted for 38.6% of it, so trimming crops does not fix it.
-
-      Passing the crop box and flip flag as conditioning turns that noise back into
-      signal: at inference you request the canonical view and the caption->image mapping
-      is single-valued again. The projection is zero-initialised, so a fresh model starts
-      exactly as if the conditioning were absent.
-
-  time_scale_shift=True (was: additive bias)
+  time_scale_shift=True
       FiLM-style conditioning (ADM / SD): scale and shift the normalized activations
-      instead of adding a bias before GroupNorm, which partly normalizes the bias away.
-      Set False to restore run 1's additive path — needed to load a run-1 checkpoint,
-      since the shape of ResNetBlock.time_proj differs.
+      instead of adding a bias before GroupNorm, which normalizes part of the bias away.
+      Set False for the additive path — the shape of ResNetBlock.time_proj differs, so old
+      checkpoints need it.
 """
 
 import math
@@ -106,9 +95,9 @@ class ResNetBlock(nn.Module):
     GroupNorm (not BatchNorm) because diffusion uses tiny batches and GroupNorm
     is per-sample. Skip uses 1x1 conv when channels change, identity otherwise.
 
-    time_scale_shift=True applies FiLM AFTER norm2: h = norm2(h) * (1 + scale) + shift.
-    time_scale_shift=False adds the projected time embedding as a bias BEFORE norm2,
-    which is what DDPM and run 1 did — simpler, but GroupNorm removes part of it.
+    time_scale_shift=True applies FiLM after norm2: h = norm2(h) * (1 + scale) + shift.
+    time_scale_shift=False adds the projected time embedding as a bias before norm2, which
+    is what DDPM does — simpler, but GroupNorm removes part of it.
     """
 
     def __init__(
@@ -205,11 +194,11 @@ class SelfAttention(nn.Module):
 
 class CrossAttention(nn.Module):
     """
-    Q from image features, K and V from text embeddings (B, 77, 768).
-    This is THE mechanism by which text controls the generated image.
+    Q from image features, K and V from text embeddings (B, 77, 768). This is how text
+    controls the generated image.
 
-    Cost is O(H*W * 77 * C) — cheap even at full resolution, because the text
-    sequence is short. Keep this everywhere self-attention gets dropped.
+    Cost is O(H*W * 77 * C) — cheap even at full resolution, because the text sequence is
+    short. Keep it everywhere self-attention gets dropped.
     """
 
     def __init__(self, channels: int, context_dim: int = 768, head_dim: int = 32):
@@ -285,9 +274,8 @@ class Stage(nn.Module):
     Used for both the encoder and the decoder — an UpStage just receives an in_ch
     that already includes the concatenated skip channels.
 
-    Note this keeps ONE skip per stage regardless of num_res_blocks, rather than
-    DDPM's one-skip-per-block. Less standard, but it keeps the assembly below
-    readable and still buys the depth, which is the point.
+    Keeps one skip per stage regardless of num_res_blocks, rather than DDPM's one per
+    block. Less standard, but it keeps the assembly below readable.
     """
 
     def __init__(
@@ -356,9 +344,9 @@ class UNet(nn.Module):
         self.time_embedding = TimeEmbedding(time_dim)
         t_emb_dim = self.time_embedding.out_dim
 
-        # Micro-conditioning on the augmentation view. Added to the time embedding, the
-        # standard place for global scalar conditioning. The output layer is zero-init so
-        # an untrained model behaves exactly as if view_dim=0.
+        # Micro-conditioning on the augmentation view, added to the time embedding — the
+        # usual place for global scalar conditioning. Zero-init output, so an untrained
+        # model behaves as if view_dim=0.
         self.view_dim = view_dim
         if view_dim > 0:
             self.view_embed = nn.Sequential(
@@ -378,8 +366,8 @@ class UNet(nn.Module):
             dropout=dropout, time_scale_shift=time_scale_shift,
         )
 
-        # Encoder. Stage 1 runs at the full latent resolution — self-attention there
-        # is the single most expensive thing in the network, hence the flag.
+        # Encoder. Stage 1 runs at full latent resolution, where self-attention is the
+        # most expensive thing in the network — hence the flag.
         self.down1 = Stage(c1, c1, use_self_attn=top_self_attn, **stage_kwargs)
         self.down1_sample = Downsample(c1)
 
@@ -408,8 +396,8 @@ class UNet(nn.Module):
         self.out_norm = _group_norm(c1 + c1)
         self.out_conv = nn.Conv2d(c1 + c1, out_channels, kernel_size=3, padding=1)
 
-        # Zero-init the output layer: the network starts by predicting exactly 0,
-        # so the first steps only have to learn a correction.
+        # Zero-init the output: the network starts by predicting exactly 0, so the first
+        # loss is the predict-zero baseline and training only learns a correction.
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 

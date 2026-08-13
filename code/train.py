@@ -6,39 +6,23 @@ Owns:
   - Optimizer + LR schedule factories
   - AMP dtype selection
   - CFG dropout helper
+  - leakage-safe split and the latent/caption dataset
   - train_step (one optimizer step end-to-end)
   - validation_loss (eval-mode, fixed-seed, comparable across epochs)
   - checkpoint save/load
 
-Changes since run 1, and why:
+Notes on two defaults:
 
-  min_snr_gamma=None, and v-prediction instead
-      Run 1 used an unweighted MSE over uniformly sampled t. At the Bayes optimum the
-      eps-loss equals alpha_bar_t, so that objective puts its signal at
-          t<100 31.5% | 100-250 35.9% | 250-500 27.2% | 500-750 5.0% | >750 0.3%
-      — almost nothing above t=500, which is where global composition is decided and
-      where run 1's samples actually failed.
-
-      Unweighted v-loss fixes this exactly: since ||v - v_hat||^2 = ||eps - eps_hat||^2
-      / alpha_bar, the same optimum gives a flat loss of 1.0 at every t, i.e. signal
-      spread uniformly per timestep (10 / 15 / 25 / 25 / 25 across those bands,
-      proportional to band width).
-
-      Min-SNR-gamma is still available but is NOT the default: on top of v-prediction
-      it peaks at SNR=gamma (alpha_bar 0.833, t~116 on this schedule) and decays both
-      ways, pushing 45% of the signal into t=100-250 and 0.4% above t=750. That is
-      the low-noise bias we are trying to remove. It is the right tool for eps-
-      prediction, not for v.
-
-  validation_loss + a held-out split
-      Run 1 put all 833 latents in train_dataset, so nothing in the logs could
-      distinguish fitting from memorizing. It also logged train-mode loss, which
-      ResNetBlock dropout inflated.
+  min_snr_gamma=None, with v-prediction
+      Unweighted v-loss is already balanced across timesteps: at the Bayes optimum it is
+      1.0 at every t. Unweighted eps-loss equals alpha_bar_t instead, which puts about a
+      third of its signal below t=100 and almost none above t=750 — and above t=500 is
+      where global composition is decided. Min-SNR-gamma is available but is the right tool
+      for eps, not v; on top of v it re-concentrates the signal at low noise.
 
   pick_amp_dtype()
-      run 1's action list said "set AMP=bf16, free on a Colab GPU". bf16 needs
-      compute capability >= 8.0 — a T4 is 7.5, so that would have fallen back or
-      errored. This picks bf16 only when the hardware supports it, else fp16.
+      bf16 needs compute capability >= 8.0, so it is unavailable on a T4 (7.5) rather than
+      free. This picks bf16 only where the hardware supports it and falls back to fp16.
 """
 
 import copy
@@ -53,11 +37,10 @@ import torch.nn.functional as F
 # EMA (Exponential Moving Average)
 def build_ema(model: nn.Module) -> nn.Module:
     """
-    Create a deep-copied shadow of the model with grads disabled.
+    Deep-copied shadow of the model with grads disabled.
 
-    EMA tracks a smoothed version of model weights over training. At
-    inference we use the EMA model, not the live one — smoother outputs,
-    less sensitive to the most recent noisy gradient step.
+    The EMA tracks a smoothed version of the weights over training. Sample from it rather
+    than the live model: smoother outputs, less sensitive to the last noisy gradient step.
     """
     ema = copy.deepcopy(model)
     ema.requires_grad_(False)
@@ -70,22 +53,20 @@ def ema_update(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999, st
     """
     In-place EMA update:   ema_param = decay * ema_param + (1 - decay) * live_param
 
-    decay=0.9999 means each step the EMA absorbs 0.01% of the new weights.
-    Effective averaging window is ~10000 steps.
+    decay=0.9999 absorbs 0.01% of the new weights per step, an averaging window of roughly
+    10,000 steps.
 
-    Because the EMA starts from the RANDOM INIT, a fixed 0.9999 leaves the shadow
-    weights mostly random for thousands of steps (90% random init at step 1000),
-    which makes early preview images pure noise no matter how well training goes.
-    Passing `step` applies the standard warmup ramp
+    The EMA starts from the random init, so a fixed high decay leaves the shadow weights
+    mostly random for thousands of steps (90% random init at step 1000) and early previews
+    are noise no matter how training is going. Passing `step` applies the usual warmup ramp
 
         effective_decay = min(decay, (1 + step) / (10 + step))
 
-    so the EMA tracks the live model closely at first and eases into `decay`.
-    Omit `step` to get the raw fixed-decay behaviour.
+    so the EMA tracks the live model closely at first and eases into `decay`. Omit `step`
+    for fixed decay.
 
-    Sanity check on a short run: the ramp is the binding term until step ~10/(1-decay).
-    Below that the EMA really does track the model; above it, check
-    ||ema - live|| / ||live|| in the notebook before trusting samples.
+    The ramp is the binding term until about step 10/(1-decay). Past that, check
+    ||ema - live|| / ||live|| before trusting samples.
     """
     if step is not None:
         decay = min(decay, (1.0 + step) / (10.0 + step))
@@ -93,8 +74,7 @@ def ema_update(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999, st
     for ema_p, p in zip(ema_model.parameters(), model.parameters()):
         ema_p.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
-    # Buffers (e.g., NoiseScheduler constants) should also be kept in sync
-    # in case the live model's buffers somehow drift. Cheap.
+    # Keep buffers in sync too, in case the live model's ever drift. Cheap.
     for ema_b, b in zip(ema_model.buffers(), model.buffers()):
         ema_b.copy_(b)
 
@@ -126,9 +106,8 @@ def pick_amp_dtype(prefer: str = "auto", device: str = "cuda", verbose: bool = T
     """
     Choose an autocast dtype that the hardware actually supports.
 
-    bf16 requires compute capability >= 8.0 (Ampere and later). A Colab T4 is 7.5,
-    so bf16 there is not "free" — it is unavailable. fp16 works on 7.5 but needs a
-    GradScaler, which train_step handles when you pass one.
+    bf16 requires compute capability >= 8.0 (Ampere and later); a Colab T4 is 7.5. fp16
+    works there but needs a GradScaler, which train_step uses when you pass one.
 
     Returns (amp_dtype_or_None, label).
     """
@@ -160,11 +139,11 @@ def apply_cfg_dropout(
     """
     With probability dropout_prob, replace each row's text embedding with the uncond embedding.
 
-    This trains the U-Net to denoise both conditionally and unconditionally
-    using the SAME weights — required for CFG at inference time.
+    Trains the U-Net to denoise both conditionally and unconditionally with the same
+    weights, which is what CFG needs at inference.
 
-    At batch 4 this yields 0.4 uncond rows per step, which averages out but very
-    noisily. It is one more reason to raise the batch size.
+    At small batch sizes this yields well under one uncond row per step, so it averages
+    out only slowly.
 
     Args:
         embeddings        : (B, 77, 768)
@@ -186,12 +165,11 @@ def make_split(
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Leakage-safe train/val split over the latents precompute.py produced.
+    Leakage-safe train/val split over the encoded latents.
 
-    Splits on GROUP (the source image), never on row. Every augmented view of one
-    Pokemon — all K crops, both flips — lands on the same side of the boundary. Without
-    this the validation set holds mirrors and crops of training images and the validation
-    loss measures nothing.
+    Splits on group (the source image), never on row, so every augmented view of one
+    Pokemon — all crops, both flips — lands on the same side. Without that, validation
+    holds crops and mirrors of training images and its loss measures nothing.
 
     Args:
         group_ids : (N_lat,) from latent_stats["group_ids"]
@@ -215,9 +193,9 @@ class LatentCaptionDataset(torch.utils.data.Dataset):
     """
     Joins latents to caption embeddings by group id, and samples a caption variant.
 
-    Why not TensorDataset: a 77x768 embedding is 237 KB, so duplicating one per crop
-    would make embeddings.pt the dominant output (K=4 with hflip pushes it past 1.5 GB).
-    Storing captions once per (image, variant) and joining here keeps it at ~400 MB.
+    A 77x768 embedding is 237 KB, so duplicating one per crop would make embeddings.pt the
+    dominant output (4 crops with flips pushes it past 1.5 GB). Storing captions once per
+    (image, variant) and joining here keeps it around 400 MB.
 
     sample_variant=True picks uniformly among that image's caption variants on every
     __getitem__, so the caption augmentation is fresh each epoch rather than a fixed
@@ -281,14 +259,13 @@ def diffusion_loss(
     view: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Min-SNR-weighted MSE against whatever the scheduler says the target is.
+    Weighted MSE against whatever the scheduler says the target is.
 
-    Returns a scalar. Per-sample MSE is computed first, then weighted, so the
-    weighting is per-timestep rather than smeared across the batch.
+    Returns a scalar. Per-sample MSE is computed first, then weighted, so the weighting is
+    per-timestep rather than smeared across the batch.
 
-    `view` is the augmentation micro-conditioning (crop box + flip). Passing it is what
-    stops the 8 augmented views of one caption from being an unpredictable 60% of the
-    target variance — see unet.UNet's view_dim note.
+    `view` is the augmentation micro-conditioning (crop box + flip); see unet.UNet's
+    view_dim note for why it matters.
     """
     x_t = noise_scheduler.q_sample(x_0, t, noise)
     target = noise_scheduler.get_target(x_0, noise, t)
@@ -326,9 +303,9 @@ def train_step(
         x_0              : (B, 4, H, W)     clean latents (per-channel normalized)
         context          : (B, 77, 768)     text embeddings
         uncond_embedding : (1, 77, 768)     empty-string embedding (for CFG dropout)
-        min_snr_gamma    : Min-SNR-gamma weighting. None = unweighted (run 1 behaviour).
+        min_snr_gamma    : Min-SNR-gamma weighting. None = unweighted.
         amp_dtype        : if set, wraps forward+loss in autocast. Params stay fp32.
-        scaler           : REQUIRED when amp_dtype is torch.float16. fp16 gradients
+        scaler           : required when amp_dtype is torch.float16. fp16 gradients
                            underflow to zero without loss scaling; bf16 has fp32's
                            exponent range and needs no scaler, so pass None there.
         step             : global step, forwarded to ema_update for the warmup ramp.
@@ -337,10 +314,9 @@ def train_step(
     B = x_0.shape[0]
     device = x_0.device
 
-    # 1. Sample timesteps uniformly across the schedule. Different t per sample
-    #    gives the model exposure to the entire noise range every batch. The
-    #    non-uniform EMPHASIS across t now comes from min_snr_gamma, not from
-    #    biasing this draw.
+    # 1. Sample timesteps uniformly across the schedule. A different t per sample gives
+    #    the model exposure to the whole noise range every batch. Any non-uniform emphasis
+    #    across t comes from min_snr_gamma, not from biasing this draw.
     t = torch.randint(0, noise_scheduler.T, (B,), device=device, dtype=torch.long)
 
     # 2. Sample fresh Gaussian noise.
@@ -394,15 +370,14 @@ def validation_loss(
     seed: int = 1234,
 ) -> dict[str, float]:
     """
-    Eval-mode loss on a fixed set of latents, with a FIXED t and noise draw.
+    Eval-mode loss on a fixed set of latents, with a fixed t and noise draw.
 
-    Two properties run 1's logging lacked:
-      - eval mode, so dropout does not inflate the number
-      - a fixed (t, noise) draw, so epoch-to-epoch changes are the model changing
-        and not which timesteps happened to be sampled
+    Both matter: eval mode so dropout does not inflate the number, and a fixed (t, noise)
+    draw so epoch-to-epoch changes are the model changing rather than which timesteps
+    happened to come up.
 
-    Returns both the weighted loss (comparable to the training number) and the
-    unweighted one (comparable to published eps-MSE figures).
+    Returns the weighted loss (comparable to the training number) and the unweighted one
+    (comparable to published eps-MSE figures).
     """
     was_training = model.training
     model.eval()
@@ -454,15 +429,14 @@ def save_checkpoint(
     """
     Save everything needed to resume training.
 
-    `config` should carry the model/scheduler kwargs so a checkpoint can be rebuilt
-    without guessing. Run 1's checkpoints did not, which is why evaluating one now
-    requires remembering base_channels=64 / num_res_blocks=1 / top_self_attn=True.
+    `config` should carry the model and scheduler kwargs so a checkpoint can be rebuilt
+    without guessing what it was trained with.
 
-    slim=True drops the optimizer, LR-schedule and scaler state — everything only needed
-    to RESUME. A checkpoint holds 4 copies of the weights (model, EMA, and AdamW's two
-    moments), so at run 2's 35.5M params each was 569 MB and 12 of them filled a Drive.
-    Slim halves that and still loads in every eval cell. Keep ONE full checkpoint as the
-    resume point and make the rest slim.
+    slim=True drops the optimizer, LR-schedule and scaler state — everything only needed to
+    resume. A full checkpoint holds four copies of the weights (model, EMA, and AdamW's two
+    moments), which at 35M params is over 500 MB each and fills a Drive quickly. Keep one
+    full checkpoint as the resume point and make the rest slim; slim ones still load in
+    every eval cell.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     payload = {

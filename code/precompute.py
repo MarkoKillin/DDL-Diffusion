@@ -1,47 +1,35 @@
 """
 Helpers for turning the Pokemon dataset into latents and caption embeddings.
 
-The notebook (`diffuser.ipynb`) owns the actual encoding pipeline — it needs the
-intermediate tensors in memory to report view noise and preview the crops, so running the
-pipeline twice (here and there) only creates two things that can drift apart. This module
-holds the pure functions both the notebook and the training code import:
+The notebook (`diffuser.ipynb`) owns the encoding pipeline itself, since it needs the
+intermediate tensors in memory to report view noise and preview the crops. This module
+holds the pure functions it imports:
 
     VIEW_DIM, CANONICAL_VIEW    the micro-conditioning vector's shape and its identity value
     build_preprocess            resize/crop transform, for display
-    crop_with_params            crop AND return the box, so the geometry can be conditioned on
+    crop_with_params            crop and return the box, so the geometry can be conditioned on
     strip_pokemon_name          caption variant 1: the proper name replaced by "creature"
-    build_caption_variants      flat caption list + the group id each caption belongs to
+    build_caption_variants      flat caption list plus the group id each caption belongs to
     normalize_per_channel       per-channel zero-mean unit-std, SD3/Flux style
 
-Design notes, kept because the reasons are not obvious from the code:
+Why the augmentation looks like this:
 
-  Crops (`crop_with_params` with crop=True)
-      Run 2 memorized hard: held-out loss ended 50% WORSE than predicting zero, and 3 of
-      4 samples were near-pixel copies of training images. The cause was arithmetic —
-      35.5M parameters against 1,500 x 4,096 = 6.1M training scalars. K random-resized
-      crops per image multiply the data K-fold for one extra VAE pass each. Crop 0 is
-      always the deterministic centre crop, so the canonical view is guaranteed present.
+  Crops multiply a small dataset K-fold for one extra VAE pass each, which is the cheapest
+  defence available when the model has more parameters than the training set has numbers.
+  Crop 0 is always the deterministic centre crop, so the canonical view is always present.
 
-  The view vector
-      Run 3 threw the crop geometry away, which made 59.9% of its target variance
-      unpredictable from the caption, and the model answered by producing blurry averages.
-      Recording `[top, left, height, width, flip]` and feeding it to the U-Net as
-      micro-conditioning (SDXL-style) is what fixed that in run 4.
+  The view vector records where each crop came from. Without it, several views per caption
+  leave part of the target unpredictable from the text, and an L2 objective answers by
+  predicting their average — which decodes as blur.
 
-  Caption variants (`strip_pokemon_name`)
-      Run 2's model keyed on the Pokemon NAME as a lookup token: shuffling captions cost
-      it 68x the matched loss, while the empty caption cost only 11x. Given no caption it
-      produced something generic and sane; given a WRONG one it confidently produced the
-      wrong image. Variant 1 replaces the name with "creature", forcing the model onto the
-      descriptive words. The captions support it — 66% contain a colour word, 35% a visual
-      noun, mean length 19.5 words.
+  Caption variants stop the model using the Pokemon's name as a lookup key and push it onto
+  the descriptive words. The captions support that: 66% contain a colour word, 35% a visual
+  noun, mean length 19.5 words.
 
-  Latents and captions are stored SEPARATELY, joined by group id
-      A 77x768 embedding is 237 KB; duplicating it per crop would dominate the output
-      (K=4 plus flips would push embeddings.pt past 1.5 GB). Instead latents carry a
-      `group_ids` array naming their source image, captions carry `caption_groups`, and
-      train.LatentCaptionDataset joins them — picking a random variant per __getitem__,
-      which makes the caption augmentation free and per-epoch.
+  Latents and captions are stored separately and joined by group id. A 77x768 embedding is
+  237 KB, so duplicating one per crop would dominate the output. Latents carry `group_ids`,
+  captions carry `caption_groups`, and train.LatentCaptionDataset joins them, picking a
+  random variant per __getitem__ so the caption augmentation is free and per-epoch.
 """
 
 from __future__ import annotations
@@ -67,13 +55,13 @@ CANONICAL_VIEW = (0.0, 0.0, 1.0, 1.0, 0.0)
 def build_preprocess(resolution: int = 256, crop: bool = False, scale=(0.8, 1.0)):
     """
     crop=False : Resize -> CenterCrop. The canonical view (crop 0).
-    crop=True  : RandomResizedCrop applied to the ORIGINAL image, so the crop is taken
+    crop=True  : RandomResizedCrop applied to the original image, so the crop is taken
                  at full source resolution and downsampled once rather than twice.
 
     Both end at [-1, 1], which is what the SD VAE expects.
 
-    Used for display and for decoding comparisons. The encoding path uses
-    crop_with_params below, which returns the box alongside the tensor.
+    Used for display and decoding comparisons. The encoding path uses crop_with_params
+    below, which returns the box alongside the tensor.
     """
     if crop:
         geom = T.RandomResizedCrop(resolution, scale=scale, ratio=(0.9, 1.1), antialias=True)
@@ -113,8 +101,8 @@ def strip_pokemon_name(caption: str, replacement: str = "creature") -> tuple[str
 
     Heuristic: a capitalised word that is not sentence-initial, not the franchise word,
     not a franchise qualifier, and not hyphenated (so "Water-type" and "egg-themed"
-    survive — those carry real visual information). Measured on the 833 captions this
-    fires on ~60%, and 442 of the words it finds are singletons, i.e. actual names.
+    survive — those carry real visual information). On the 833 captions it fires on about
+    60%, and most of the words it finds appear once, i.e. they really are names.
 
     Returns (variant, changed).
     """
@@ -158,10 +146,10 @@ def normalize_per_channel(latents: torch.Tensor):
     """
     Returns (normalized, mean, std) with mean/std shaped (1, C, 1, 1).
 
-    After this, every channel is zero-mean unit-std across the dataset, so x_T ~ N(0, I)
-    at inference is genuinely the distribution the forward process ends at. Run 1's
-    single global 0.18215 left per-channel means up to +1.50, which the model learned to
-    read off its input rather than generate.
+    After this every channel is zero-mean unit-std across the dataset, so the x_T ~ N(0, I)
+    that inference starts from really is where the forward process ends. The single global
+    0.18215 scale does not do that: it leaves per-channel means as high as +1.5, which a
+    model can read off its input instead of generating.
     """
     mean = latents.mean(dim=(0, 2, 3), keepdim=True)
     std = latents.std(dim=(0, 2, 3), keepdim=True)
