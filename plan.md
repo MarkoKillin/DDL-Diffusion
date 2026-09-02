@@ -2,7 +2,7 @@
 
 **Goal:** build a text-to-image Latent Diffusion Model trained on `lambdalabs/pokemon-blip-captions`. The diffusion math, the U-Net and the training loop are all written by hand in PyTorch. This is a learning project, so we implement together, step by step.
 
-**Environment:** Google Colab (single GPU, limited VRAM)
+**Environment:** a rented single-GPU Linux box (vast.ai), RTX 4090 class. Runs 1-4 were on a Colab T4
 
 **Constraint:** we do NOT train the VAE or Text Encoder. We pre-compute latents and text embeddings using HuggingFace, save them as tensors, then train only the U-Net.
 
@@ -56,16 +56,18 @@ We don't diffuse in pixel space, which is too expensive. Instead a pre-trained V
 - `accelerate` (optional, for cleaner device handling)
 - `numpy`, `tqdm`, `matplotlib`
 
-**Colab setup:**
+**Machine setup:**
 - Verify GPU with `torch.cuda.is_available()` and `torch.cuda.get_device_name(0)`
-- Mount Google Drive for saving checkpoints and pre-computed data
+- Run the notebook from the repo's `code/` directory, so the hand-written modules import
+- Everything downloads from the Hub at runtime, so nothing needs uploading. The instance disk is
+  usually ephemeral, so copy `checkpoints/` and the `.pt` files off before stopping it
 - Set seeds (`torch.manual_seed`, `numpy.random.seed`) for reproducibility
 
 ---
 
 ## Step 2: data pre-computation pipeline (run once)
 
-A one-off script. Run it once, save results to Drive, never run again. It frees the VAE and text encoder from VRAM during training.
+A one-off script. Run it once, keep the `.pt` files, never run it again. It frees the VAE and text encoder from VRAM during training.
 
 1. **Load pre-trained models:**
    - VAE from `stabilityai/sd-vae-ft-mse` (no gated access, no HF login required)
@@ -157,7 +159,8 @@ Output: predicted noise (B, 4, 64, 64)
 
 **Skip connections:** concatenate encoder features with decoder features along the channel dim (`torch.cat(dim=1)`). The first ResNet of each UpBlock takes `2*C` channels in.
 
-**Channel dims kept small** (64/128/256) to fit in Colab VRAM.
+**Channel dims** started at 64/128/256 to fit a T4. Run 5 uses `base_channels=128`, so
+512 channels at the bottleneck, which needs a 16 GB card or better.
 
 ---
 
@@ -198,8 +201,8 @@ Output: predicted noise (B, 4, 64, 64)
 - Plot the loss curve
 
 ### Checkpointing
-- Save `{model_state, ema_state, optimizer_state, scheduler_state, step, epoch}` every 25 epochs
-- Save to Google Drive, since Colab sessions die
+- Save `{model_state, ema_state, optimizer_state, scheduler_state, step, epoch}` every 5 epochs
+- A rented instance can vanish, so keep a resumable `last.pt` current and pull it off the box
 - Implement resume-from-checkpoint
 
 ---
@@ -272,4 +275,9 @@ After everything works in float32:
 - Runs 1-4 confirmed the overfitting risk and then hit its ceiling: 750 distinct
   caption→image pairs cap held-out v-loss at ~0.57 regardless of architecture. See
   **Dataset choice for run 5** in [`RUNS.md`](RUNS.md) for the measured argument and the
-  candidate replacements (Flowers-102, CUB-200, COCO), with model sizes for each
+  candidate replacements, with model sizes for each
+- Run 5 is `Ryan-sjtu/celebahq-caption`: 30,000 aligned faces, one BLIP caption each, at
+  `base_channels=128` on a local RTX 4090-class card. The goal is sample quality on unseen
+  attribute combinations, so the target prompt is something like "a photography of a man with
+  glasses wearing a hat". **Run 5 config** in [`RUNS.md`](RUNS.md) has the settings and the
+  expected failure modes

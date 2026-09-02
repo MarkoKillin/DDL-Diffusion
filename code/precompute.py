@@ -1,5 +1,5 @@
 """
-Helpers for turning the Pokemon dataset into latents and caption embeddings.
+Helpers for turning a captioned image dataset into latents and caption embeddings.
 
 The notebook (`diffuser.ipynb`) owns the encoding pipeline itself, since it needs the
 intermediate tensors in memory to report view noise and preview the crops. This module
@@ -10,6 +10,7 @@ holds the pure functions it imports:
     crop_with_params            crop and return the box, so the geometry can be conditioned on
     strip_pokemon_name          caption variant 1: the proper name replaced by "creature"
     build_caption_variants      flat caption list plus the group id each caption belongs to
+    build_multi_captions        the same, for datasets with several real captions per image
     normalize_per_channel       per-channel zero-mean unit-std, SD3/Flux style
 
 Why the augmentation looks like this:
@@ -17,14 +18,16 @@ Why the augmentation looks like this:
   Crops multiply a small dataset K-fold for one extra VAE pass each, which is the cheapest
   defence available when the model has more parameters than the training set has numbers.
   Crop 0 is always the deterministic centre crop, so the canonical view is always present.
+  Run 3 measured the price: 8 views per caption left 59.9% of the target variance
+  unpredictable from the text, and an L2 objective answers that with a blurry average. Set
+  CROPS=1 once the dataset is large enough to stand on its own.
 
-  The view vector records where each crop came from. Without it, several views per caption
-  leave part of the target unpredictable from the text, and an L2 objective answers by
-  predicting their average — which decodes as blur.
+  The view vector records where each crop came from, turning that ambiguity into signal.
 
-  Caption variants stop the model using the Pokemon's name as a lookup key and push it onto
-  the descriptive words. The captions support that: 66% contain a colour word, 35% a visual
-  noun, mean length 19.5 words.
+  Caption variants stop the model using a proper name as a lookup key and push it onto the
+  descriptive words. Only needed when the dataset has one caption per image, as Pokemon
+  does. Flowers-102, CUB-200 and COCO ship several real captions, which is strictly better,
+  and build_multi_captions handles those.
 
   Latents and captions are stored separately and joined by group id. A 77x768 embedding is
   237 KB, so duplicating one per crop would dominate the output. Latents carry `group_ids`,
@@ -128,6 +131,9 @@ def build_caption_variants(captions: list[str], n_variants: int) -> tuple[list[s
     """
     Returns (flat_caption_list, caption_groups) where caption_groups[j] is the index of
     the source image for caption j. Variant 0 is always the original.
+
+    For the Pokemon set, which has one caption per image. Use build_multi_captions below
+    when the dataset ships several real captions instead.
     """
     flat, groups = [], []
     for i, c in enumerate(captions):
@@ -140,6 +146,38 @@ def build_caption_variants(captions: list[str], n_variants: int) -> tuple[list[s
         if n_variants > 2:
             raise ValueError("only 2 caption variants are implemented (original + name-stripped)")
     return flat, torch.tensor(groups, dtype=torch.long)
+
+
+def build_multi_captions(
+    caption_lists: list[list[str]],
+    n_per_image: int,
+) -> tuple[list[str], torch.Tensor, int]:
+    """
+    Flatten per-image caption lists down to exactly n_per_image each.
+
+    For datasets that ship several human captions per image: Flowers-102 and CUB-200 have
+    10, COCO has 5. Every one is a different description of the same picture, so the model
+    learns that many phrasings map to one image. That is the thing the Pokemon set could
+    not teach, since 62% of its captions carried a memorizable proper name and the only
+    second variant was that name removed.
+
+    Returns (flat, caption_groups, n_cycled). caption_groups[j] is the source image index
+    of caption j, which is what train.LatentCaptionDataset joins on.
+
+    Images with fewer than n_per_image captions have theirs cycled rather than raising,
+    because LatentCaptionDataset needs a rectangular (image, caption) table. `n_cycled`
+    counts them so the notebook can report it. Extra captions past n_per_image are dropped.
+    """
+    flat, groups, n_cycled = [], [], 0
+    for i, caps in enumerate(caption_lists):
+        if not caps:
+            raise ValueError(f"image {i} has no captions")
+        if len(caps) < n_per_image:
+            n_cycled += 1
+        for k in range(n_per_image):
+            flat.append(caps[k % len(caps)])
+            groups.append(i)
+    return flat, torch.tensor(groups, dtype=torch.long), n_cycled
 
 
 def normalize_per_channel(latents: torch.Tensor):

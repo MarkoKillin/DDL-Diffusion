@@ -193,18 +193,19 @@ class LatentCaptionDataset(torch.utils.data.Dataset):
     """
     Joins latents to caption embeddings by group id, and samples a caption variant.
 
-    A 77x768 embedding is 237 KB, so duplicating one per crop would make embeddings.pt the
-    dominant output (4 crops with flips pushes it past 1.5 GB). Storing captions once per
-    (image, variant) and joining here keeps it around 400 MB.
+    Embeddings are stored once per (image, caption) and joined here rather than duplicated
+    per crop, because a token x 768 embedding is large: at 32 tokens, 5 captions each for
+    8,189 Flowers images is 2.0 GB in fp16, and duplicating that across crops and flips
+    would multiply it again. Notebook writes fp16; __getitem__ casts back to fp32.
 
-    sample_variant=True picks uniformly among that image's caption variants on every
-    __getitem__, so the caption augmentation is fresh each epoch rather than a fixed
-    pairing. Set False for deterministic evaluation (always variant 0, the original).
+    sample_variant=True picks uniformly among that image's captions on every __getitem__,
+    so the caption augmentation is fresh each epoch rather than a fixed pairing. Set False
+    for deterministic evaluation (always caption 0).
 
     Args:
         latents        : (N_lat, C, H, W)
         group_ids      : (N_lat,)   source image per latent
-        embeddings     : (N_cap, 77, 768)
+        embeddings     : (N_cap, L, 768)
         caption_groups : (N_cap,)   source image per caption
     """
 
@@ -244,7 +245,10 @@ class LatentCaptionDataset(torch.utils.data.Dataset):
         row = self.caption_table[gid]
         j = row[torch.randint(self.n_variants, (1,)).item()] if self.sample_variant else row[0]
         view = self.view_params[i] if self.view_params is not None else torch.zeros(0)
-        return self.latents[i], self.embeddings[j], view
+        # embeddings.pt is stored fp16 (10 captions per image over 8k images is 4 GB in
+        # fp32), so cast here. The model's params are fp32 and autocast does not cover a
+        # tensor arriving from the DataLoader.
+        return self.latents[i], self.embeddings[j].float(), view
 
 
 # Loss

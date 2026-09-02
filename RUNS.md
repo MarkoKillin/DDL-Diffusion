@@ -31,44 +31,199 @@ from the caption, and the average of 8 views decodes as blur. Two properties fol
 Pokemon is an easy target with too little data. COCO is a hard target with enough data.
 Single-subject datasets in between move only the first of the two.
 
+One refinement to point 1, because the plain "MSE predicts the average" story is incomplete for
+a diffusion model. The prediction is conditioned on the noisy latent as well as the text, so at
+low noise the latent already carries the identity and the model can be sharp even when the
+caption is vague. An ambiguous caption mainly shows up as diversity across seeds and as weak
+prompt fidelity. It turns into visible mush only when the model is *also* data-starved or
+under-trained, which is exactly the run 3 and run 4 situation. Read the 59.9% figure as "the
+conditioning is carrying little of the load here", not as "blur is arithmetically forced".
+
 ### Options
 
-| Dataset | Images | Captions/image | Structure | Caption source |
+| Dataset | Images | Captions/image | Structure | Captions ship with the images? |
 |---|---|---|---|---|
-| current: `pokemon-gpt4-captions` | 833 | 2 (1 synthetic) | single subject, plain bg | GPT-4, names memorizable |
-| **Oxford Flowers-102** | **8,189** | **10** | single subject, plain bg | human, Reed et al. 2016 |
-| **CUB-200-2011 birds** | **11,788** | **10** | single subject, natural bg | human, Reed et al. 2016 |
-| Multi-Modal CelebA-HQ | 30,000 | 10 | aligned faces | attribute-derived |
-| COCO 2017 | 118,287 | 5 | multi-object scenes | human |
+| current: `pokemon-gpt4-captions` | 833 | 2 (1 synthetic) | single subject, plain bg | yes |
+| Oxford Flowers-102 | 8,189 | 10 | single subject, plain bg | **no** |
+| CUB-200-2011 birds | 11,788 | 10 | single subject, natural bg | **no** |
+| **Multi-Modal CelebA-HQ** | **30,000** | **10 on paper, 1 on the Hub** | aligned faces, single subject | yes |
+| Flickr30k | 31,783 | 5 | scenes | yes |
+| COCO 2017 | 118,287 | 5 | multi-object scenes | yes |
 
-Flowers and CUB are the standard small-scale text-to-image benchmarks (StackGAN, AttnGAN,
-DF-GAN), so published numbers exist to compare against.
+**The last column is the one that decided this, and it was not obvious.** Flowers-102 and
+CUB-200 are the standard small-scale text-to-image benchmarks (StackGAN, AttnGAN, DF-GAN), so
+they looked like the clean choice. But their captions are not part of the image dataset. The
+Oxford and Caltech distributions are classification data: `torchvision.datasets.Flowers102`
+returns `(image, int_label)` and carries no caption text and no species names at all. The 10
+captions per image come from a separate Reed et al. 2016 archive with a history of dead
+mirrors, joined by filename. Same for CUB.
 
-### Recommendation: Flowers or CUB as run 5
+So the "easy target with more images" middle step is harder to obtain than it looks. Of the
+datasets that ship captions, only CelebA-HQ keeps the single-centred-subject structure that
+makes the target easy; the rest are scenes.
 
-It changes exactly one variable, the number of distinct images. COCO changes four at once
-(image count, scene complexity, caption ambiguity, required capacity), so if COCO samples come
-out bad there is no way to tell which of the four caused it.
+### Recommendation: CelebA-HQ as run 5
 
-Two things come free with it:
+It changes close to one variable, the number of distinct images, which is what makes the
+result readable. COCO changes four at once (image count, scene complexity, caption ambiguity,
+required capacity), so bad COCO samples would not say which of the four caused it.
 
-- **~82,000 distinct caption→image pairs** (8,189 × 10) against the current 750.
-- **No proper nouns to key on.** Flower and bird descriptions have none, so
-  `strip_pokemon_name` and the whole caption-variant path can go. Run 2's finding 6 problem
-  cannot recur.
+- **36× the distinct images**: 30,000 against 750.
+- **Aligned, centred faces**, so the structural prior stays as easy as Pokemon's. Arguably
+  easier: CelebA-HQ is landmark-aligned, so the eyes sit in nearly the same place every time.
+- **No proper nouns to key on**, so `strip_pokemon_name` and the caption-variant path go away
+  and run 2's finding 6 cannot recur.
 
-Keep `base_channels=64`. 17.6M against ~7,370 train images is 2,390 params per image, 10×
-safer than run 4's 23,500. Drop the crops (run 3 finding 5), keep hflip. Precompute is
-minutes at 8k images; training is under an hour on a 4090.
+What it costs, stated plainly. One caption per image and a narrow visual domain, so this is a
+weaker test of language understanding than Flowers or COCO would be. See **Run 5 config** below
+for what that does and does not rule out.
 
-**Read the result off two numbers.** If best held-out drops well below 0.5658 and the
-train/val gap stays near zero for the full run, data was the constraint and COCO is worth the
-day. If it still overfits at 8k distinct images, something else is wrong and COCO would have
-wasted that day.
+**`CAPTIONS_PER_IMAGE` is a RAM knob, not a quality knob.** At 30,000 images and
+`MAX_LENGTH=32`, each caption per image costs ~1.5 GB of fp16 embeddings. The dataset only has
+one, so `N_CAPS` clamps to 1 and the file is ~1.5 GB. The knob matters again on Flickr30k.
 
-Check before committing: the Reed captions ship separately from the flower and bird images and
-are mirrored on HuggingFace under several names of varying quality. Confirm images and
-captions load correctly paired before planning a run around it.
+**Read the result off two numbers.** If the train/val gap stays near zero for the full run,
+distinct images were the constraint and COCO is worth the day. Note that held-out v-loss is not
+comparable across datasets, so run 3's 0.5658 is not a bar CelebA-HQ can be measured against.
+The gap, not the level.
+
+### What is actually on the Hub
+
+Checked on 2026-08-31 against `datasets-server.huggingface.co/info?dataset=<id>`, so the
+columns and row counts below are the ones the viewer reports, not the ones the paper claims.
+
+The caveat above turned out to be half right. `Ryan-sjtu/celebahq-caption` does exist and does
+carry sentences: 30,000 rows, columns `image` and `text`, 2.76 GB parquet. But it stores **one**
+caption per image, not ten, and `IIGROUP/MM-CelebA-HQ-Dataset` returns 401, so the ten-caption
+MM-CelebA text cannot be fetched and joined. Take CelebA-HQ as a 30,000-image, one-caption
+dataset or not at all. `korexyz/celeba-hq-256x256` is 30,000 images already at 256 px but has
+only a male/female label.
+
+Of the datasets that ship several real captions with the images, three are usable:
+
+| Dataset | Images | Captions/image | Caption column | Size | Catch |
+|---|---|---|---|---|---|
+| `jxie/flickr8k` | 8,000 | 5 | `caption_0`..`caption_4` | 1.1 GB | only 8k distinct images |
+| `nlphuji/flickr30k` | 31,014 | 5 | `caption`, a list | 4.3 GB | zip + loading script, so `datasets` 3.x needs the `refs/convert/parquet` branch |
+| `HuggingFaceM4/NoCaps` | 15,100 | ~11 | `annotations_captions` | 4.8 GB | splits are validation 4,500 and test 10,600, no train split |
+
+`build_multi_captions` already handles all three shapes once the caption cell is normalized to a
+list, which cell 3 of the notebook does.
+
+All three are scenes rather than single subjects, so they move both variables at once and the
+blur argument above applies to them the same way it applies to COCO. Flickr30k is the closest
+in scale to CelebA-HQ, so running it after CelebA-HQ isolates scene structure with image count
+roughly held fixed.
+
+Rejected, with the reason:
+
+- `jxie/coco_captions`: stores one row per caption with the image duplicated, 566,747 rows and
+  87 GB for 113k distinct images.
+- `phiyodr/coco2017`: has the 5-caption list but images are `coco_url` strings only, so the
+  images are a separate download.
+- `efekankavalci/flowers102-captions` (8,189) and `Multimodal-Fatima/CUB_train` (5,994): one
+  caption per image, both synthetic. This confirms the point made above, the Reed 10-caption
+  archives for Flowers and CUB are still not on the Hub.
+
+### Run 5 config, decided
+
+Two things changed after the section above was written. The captions are not what it assumed,
+and training moved off Colab onto a local RTX 4090-class card.
+
+**The captions are BLIP-style free text, not attribute templates.** First rows of
+`Ryan-sjtu/celebahq-caption`, verbatim:
+
+- "a photography of a woman with a very long blond hair"
+- "a photography of a young man with a necklace and a black shirt"
+- "a photography of a woman with a smile on her face"
+
+That is better than the attribute-template vocabulary the recommendation feared. Gender, hair,
+expression, glasses, hats and clothing are all named in ordinary English. Nearly every caption
+opens with "a photography of", so inference prompts should carry that prefix.
+
+**The goal for this run is sample quality**, specifically: an unseen attribute combination such
+as "a photography of a man with glasses wearing a hat" should produce a recognizable
+approximation. That is the easy case of compositional generalization. Glasses and hats are each
+around 5% of CelebA, so the model sees each attribute thousands of times alone and the
+conjunction a few hundred times. It composes at inference; it is not being asked to invent a
+concept.
+
+| Knob | Value | Why |
+|---|---|---|
+| `DATASET_ID` | `Ryan-sjtu/celebahq-caption` | Verified: 30,000 rows, `image` + `text`, 2.76 GB parquet |
+| `CAPTIONS_PER_IMAGE` | 1 | Only one exists; `N_CAPS = min(...)` clamps it already |
+| `RESOLUTION` | 256 | 32×32 latents, unchanged |
+| `CROPS` | 1 | Run 3 finding 5. Several views per caption is what made Pokemon muddy |
+| hflip | keep, with the view vector | The flip flag in `CANONICAL_VIEW` makes the flip predictable from conditioning, so it doubles the data without re-creating the ambiguity |
+| `base_channels` | 128 | 60.1M params, 1,940 per image, still 12× below where run 4 memorized |
+| Batch | 32 | VRAM is free at 32×32 latents on 24 GB |
+| `EMA_DECAY` | 0.999 | Run 4's fix |
+| `NUM_EPOCHS` | 40 | `HFLIP` doubles the latents to 60,000, so 1,688 steps/epoch at batch 32 after the 10% val split. ~67k steps, ~6h. Drop to 25 for a ~3.7h run |
+| CFG at sampling | 2 to 4 | Run 4: above ~4 inverts the latent statistics |
+
+`embeddings.pt` is 1.5 GB and `latents.pt` 491 MB (60,000 rows, because `HFLIP` adds a mirrored
+pass), so both stay in RAM comfortably.
+
+**What to expect.** Sharp aligned faces, correct eye placement (CelebA-HQ is landmark-aligned,
+which is most of why this works), plausible hair and skin. Usual failure modes are ears, teeth,
+earrings, background, and asymmetric eye colour. Nothing outside the face crop: no scenes, no
+full bodies, no backgrounds on request, because the dataset is head-and-shoulders only.
+
+### Hardware, and what it does to the other options
+
+Roughly 6× a T4 for this workload at bf16, which is native on Ada and Blackwell, so plan.md
+step 8 applies as written with no `GradScaler`. VRAM stops binding; wall-clock and dataset
+download become the constraints. Estimates below scale run 4's measured ~14,200 steps/h at
+base64 batch 16 by the GFLOP column, so they are optimistic.
+
+| Dataset @ size | 4090 | 5090 | 5080 |
+|---|---|---|---|
+| CelebA-HQ @ base128, 40 ep | 6.0h | 4.0h | 9.1h |
+| Flickr30k @ base128, 20 ep | 1.7h | 1.1h | 2.6h |
+| COCO @ base128, 10 ep | 3.3h | 2.2h | 5.0h |
+| COCO @ base192, 10 ep | 7.2h | 4.8h | 11h |
+
+Cheap compute re-ranks the alternatives. The case against COCO was mostly a cost argument, and
+at 3.3h it largely dissolves; what survives is that COCO still changes four variables at once,
+so a blurry COCO result would not say which one caused it. Flickr30k at 1.7h is the control
+that makes a COCO run readable, and it is the run to do next if the question becomes language
+rather than image quality. Its samples will look worse than CelebA-HQ's while its numbers look
+better, and both are true at once.
+
+Two things that bite on a local box:
+
+- **Embeddings, not VRAM, are the ceiling on COCO.** 118k images × 2 captions × `MAX_LENGTH=32`
+  in fp16 is 11.6 GB, and the notebook holds `embeddings.pt` in RAM. Flickr30k is 3.0 GB and
+  fine. COCO needs either a memory-map or storing token ids and running CLIP in the dataloader.
+  Decide before the precompute pass, not after.
+- **Blackwell needs torch 2.7+ on cu128** for sm_120. A 5090 on an older wheel fails at import.
+
+### Running it on a rented GPU
+
+**Nothing needs uploading.** `datasets.load_dataset("Ryan-sjtu/celebahq-caption")` pulls the
+2.76 GB parquet from the Hub at runtime, and the VAE and CLIP come from the Hub the same way.
+The dataset is public and ungated, so no token. It caches to `~/.cache/huggingface` on the
+instance disk, so a fresh instance re-downloads it.
+
+Run the notebook from the repo's `code/` directory, since the setup cell checks for
+`scheduler.py` beside it and puts the working directory on `sys.path`. Everything it writes,
+the four `.pt` files and `checkpoints/`, lands in that directory. **Pull `best.pt` and `last.pt`
+off the box before you stop it**, the disk is ephemeral.
+
+**What the run costs**, 40 epochs at base128:
+
+| Card | Time | Note |
+|---|---|---|
+| RTX 4090 | ~6h | ~$0.40/h, so about $2.50 |
+| RTX 5090 | ~4h | needs a torch 2.7+/cu128 image for sm_120 |
+| RTX 5080 | ~9h | 16 GB is enough at base128, but caps batch size |
+| T4 | ~36h | what runs 1-4 used. Not viable at base128 |
+
+`FULL_EVERY = 5` writes a resumable `last.pt` every 5 epochs. `best.pt` and the `MILESTONES`
+snapshots are slim, meaning no optimizer state, so they can evaluate but not resume. If the
+instance dies, set `RESUME_PATH = "checkpoints/last.pt"` and re-run the training cell. A full
+checkpoint at 60.1M params is ~960 MB and `last.pt` is overwritten in place, so it stays one
+file.
 
 ### Model size, if the target is COCO
 
@@ -150,8 +305,9 @@ concepts. Run 3 finding 4 already measured why this does not work.
 - [ ] **Re-run cells 26–34 against `best.pt`, not `epoch_100.pt`.** Run 4's eval describes a
       checkpoint 84 epochs past the val minimum, so its −21.9% at t=975 and 0.587 memorization
       ratio are both worse than the run's actual best.
-- [ ] **Run 5 on Flowers-102 or CUB-200**, `base_channels=64`, no crops, no caption variants.
-- [ ] Verify the Reed caption source loads paired with images before building on it.
+- [ ] **Run 5 on Multi-Modal CelebA-HQ**, `base_channels=64`, no crops, 20 epochs. The
+      notebook is already configured for it.
+- [ ] Confirm the chosen Hub mirror actually has caption sentences, not just attribute columns.
 - [ ] Only after run 5 answers the question: COCO at `base_channels=128`, with the config table
       above.
 
