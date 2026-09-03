@@ -6,6 +6,78 @@ said, and what to change next. See [`plan.md`](plan.md) for the design and
 
 ---
 
+## Run 5 · 2026-09-03 · 40 epochs · generalization gap closed, attribute binding weak
+
+CelebA-HQ (`Ryan-sjtu/celebahq-caption`), 30,000 images, `base_channels=128` (60.1M params),
+60,000 latents (1 crop x 2 flips), 1 caption each, batch 32, 40 epochs, ~67k steps, on a
+rented RTX 5090.
+
+**The eval section was never run.** The memorization cell OOM-killed the instance and the
+checkpoints went with it, so everything below is from the training log and the inline
+previews. Numbers for the eval cells will have to come from run 6.
+
+### Result
+
+| | Run 4 (Pokemon) | Run 5 (CelebA-HQ) |
+|---|---|---|
+| Train/val gap, epoch 2 | — | **+0.0003** |
+| Train/val gap, epoch 4 | — | **+0.0009** |
+| Gap at end of run | +0.6447 | **~0, never diverged** |
+| Val minimum at | epoch 16 of 150 | did not bottom by epoch 40 |
+
+Epoch 2 was train 0.5708 / val 0.5711, epoch 4 train 0.5574 / val 0.5582.
+
+**Do not compare 0.57 here against run 3's 0.5658.** The resemblance is coincidence; held-out
+v-loss is not comparable across datasets. The gap is the measurement, not the level.
+
+### Findings
+
+**1. Distinct images was the constraint, and 30,000 removes it.** The decision criterion set
+out below was "if the train/val gap stays near zero for the full run". It did. Steps make the
+comparison fair: run 4 had 187 steps/epoch and diverged at ~2,992 steps, while run 5 passed
+that at epoch 2 and stayed gapless through ~67k steps with a 3.4x larger model.
+
+**2. The throughput estimates were wrong by 10x, in the good direction.** Measured 30-40 s per
+epoch, so ~25 min for the full run against the 4.0 h predicted. The table below scales run 4's
+T4 throughput by GFLOP ratio, which bakes in run 4's 2% utilization. That figure came from a
+17.6M model at batch 16 on Turing, where kernel launches dominated; at base128 on Blackwell the
+kernels are large enough to feed the GPU, and the measured ~1,545 img/s is ~64 TFLOPS, or
+20-30% utilization. **Compute is no longer a constraint on this project.**
+
+**3. Flattening curves at epoch 40 say nothing on their own.** The cosine schedule anneals LR
+to exactly 0 at `NUM_EPOCHS`, so every run flattens at the end by construction. Convergence and
+schedule-end are not separable without changing the epoch count.
+
+**4. Unseen prompts mix facial features.** The model learned the face manifold but blends modes
+instead of binding attributes to them. This is the weakness predicted when the dataset was
+chosen: one caption per image, a narrow visual domain, and formulaic BLIP captions nearly all
+opening "a photography of". Untested at higher CFG, since the checkpoints were lost, and
+guidance is exactly the lever that sharpens attribute binding.
+
+**5. The memorization cell cannot run at this scale.** With `CROPS=1` every row is crop 0, so
+`mem_rows` was all 54,000 training rows and the cell asked for a 11.7 GB distance matrix, a
+2.9 GB mask and an 11.7 GB masked copy, ~27 GB live, in CPU RAM. The box swapped, the OOM
+killer fired, jupyter-server stopped answering (hence "failed to save"), and the instance died.
+`off_diag.quantile(0.01)` would have thrown separately at 2.9e9 elements against quantile's
+2^24 cap, which is run 3's bug surviving in a second place. Now fixed: the reference
+distribution is estimated from a 4,000-row subsample with `kthvalue`, and the
+nearest-neighbour search still runs against every training row.
+
+### Action items for run 6
+
+- [ ] **`base_channels=192`, 60 epochs.** Applied to the notebook. Flattening without
+      overfitting is the capacity-limited signature, and the model-size table says go to 192.
+      ~1.5-2 h at measured throughput.
+- [ ] **Run the CFG sweep before drawing any conclusion about attribute binding.** Previews
+      ran at 2.0. The "above ~4 inverts the latent statistics" warning comes from a 17.6M model
+      on 750 images and probably does not bind here.
+- [ ] **Pull `checkpoints/` off the box at the halfway mark**, not only at the end.
+- [ ] If mixing survives higher CFG and 192 channels, the next suspect is cross-attention
+      density: `Stage` injects text once per stage, where SD interleaves attention with every
+      ResNet block. That is an architecture change and breaks checkpoint compatibility.
+
+---
+
 ## Dataset choice for run 5
 
 The generalization floor has not moved in two runs: best held-out v-loss 0.5658 (run 3,
