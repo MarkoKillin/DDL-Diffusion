@@ -6,6 +6,104 @@ said, and what to change next. See [`plan.md`](plan.md) for the design and
 
 ---
 
+## Run 6 · 2026-09-05 · 60 epochs · attribute binding works, no memorization, not converged
+
+CelebA-HQ (`Ryan-sjtu/celebahq-caption`), 30,000 images, `base_channels=192` (128.9M params),
+60,000 latents (1 crop x 2 flips), 1 caption each, batch 32, 60 epochs, 101,220 steps, bf16,
+on the same rented Blackwell card as run 5. Roughly 2 h wall-clock, so ~120 s/epoch. That is
+approximate: the tqdm bars run with `leave=False` and are not in the saved notebook, so this
+is the reported total divided by the epoch count, not a measurement.
+
+This is the first run where the eval section completed. Run 5's numbers were never produced.
+
+### Result
+
+| | Run 5 (base128, 40 ep) | Run 6 (base192, 60 ep) |
+|---|---|---|
+| Params | 60.1M | 128.9M |
+| Steps | ~67k | 101,220 |
+| Best held-out v-MSE | not measured | **0.5325 at epoch 60** |
+| Train at end | — | 0.5258 |
+| Gap at end | ~0 | **+0.0067** |
+| Eval section | died (OOM) | ran fully |
+
+Checkpoint sweep, all EMA weights:
+
+| file | epoch | train | held-out | gap |
+|---|---|---|---|---|
+| `epoch_15.pt` | 15 | 0.5389 | 0.5412 | +0.0022 |
+| `epoch_30.pt` | 30 | 0.5325 | 0.5362 | +0.0037 |
+| `epoch_45.pt` | 45 | 0.5277 | 0.5331 | +0.0054 |
+| `best.pt` = `epoch_60.pt` | 60 | 0.5258 | 0.5325 | +0.0067 |
+
+### Findings
+
+**1. Attribute binding works. Run 5 finding 4 is resolved.** The unseen-prompt grid binds all
+four combinations: blond + smiling + high cheekbones, older + glasses + receding hair, short
+black hair + not smiling, dark curly hair + heavy makeup + earrings. No feature mixing. Run 5
+blended modes instead of binding them, and 2.1x the parameters fixed it. Prompt effect is 71%
+of total variation: four prompts off one shared `x_T` sit 64.37 apart on average, against
+90.61 for the same prompts with independent noise.
+
+**2. The CFG warning from run 4 does not apply at this scale.** The sweep at 1.5 / 2.0 / 3.0 /
+5.0 holds per-sample std within +2% to +3% of the training reference with no inversion. Run 4's
+"above ~4 inverts the latent statistics" came from a 17.6M model on 750 images, exactly as run
+5's action item suspected. `README.md` updated.
+
+**3. Conditioning is real and it is not memorized pairing.** Shuffling the caption costs 11.2%
+on held-out images at t=900 against 13.5% on training images, and the two curves track each
+other at every timestep. Against a no-text baseline the model is +41.0% on held-out and +41.3%
+on train. If the caption-to-image map were memorized, the training number would run away from
+the held-out one; it does not.
+
+**4. No memorization, measured properly this time.** Mean nearest-neighbour distance from a
+sample to a training latent is 59.66 against 60.71 to a held-out latent, a ratio of 0.983. The
+generated samples land between the 5.7th and 89.1th percentile of the held-out distribution.
+Run 4's memorization is gone and it stayed gone at 3.4x run 4's capacity.
+
+**5. The memorization cell's threshold was wrong, and had been since it was written.** It
+compared a min-over-54,000-rows distance against the *bulk* of the train-vs-train pairwise
+distribution and flagged all four samples. A minimum over 54k candidates is far smaller than a
+typical pairwise draw before memorization enters it, so the flag was measuring the candidate
+count. Two compounding bugs: `mem_rows = train_idx[crop_ids == 0]` was written to keep one row
+per image but filters nothing when `CROPS == 1`, so each image sat in the reference pool twice
+(original + `hflip`), and a near-symmetric aligned face is close to its own mirror. That put
+the "unambiguous copy" floor at 22.73, a face against its own reflection. Now rebuilt: the null
+is nearest-neighbour distance from a *held-out* latent into the full training set, which is the
+same shape as the statistic and is non-memorized by construction. No sample flags under it.
+
+**6. CelebA-HQ contains duplicates that a group-id split cannot separate.** Surfaced by the
+rebuilt null, whose minimum came out at 0.00. Of 2,048 held-out rows, 3 have an exact training
+copy (0.15%), 14 sit below distance 20 (0.68%) and 33 below 30 (1.61%), against a held-out
+median of 61.32 and a distinct-faces median of 83.24. These are distinct `group_id`s with
+identical content, so splitting on groups does not catch them. **Under 1% contamination, so the
++0.0067 gap stands.** The one live consequence is that `p1` of the null is 25.79, which sits
+inside the duplicate population, so the suspicious threshold currently only catches near-exact
+copies and would miss softer memorization. Drop rows below ~30 before taking percentiles if
+that flag ever needs to do real work.
+
+**7. Not converged, but nearly out of road.** Held-out loss fell monotonically to the last
+epoch, so epoch 60 is where the cosine schedule hit LR 0, not where the model stopped learning
+(run 5 finding 3, again). But epochs 45 to 60 bought 0.5331 to 0.5325. More epochs or more
+width will keep paying at that rate, which is not worth a run.
+
+### Action items
+
+- [x] `base_channels=192`, 60 epochs. Done, and it resolved the binding weakness.
+- [x] CFG sweep before concluding anything about binding. Done, and it invalidated the warning.
+- [x] Pull `checkpoints/` off the box. Done, run 5's loss did not repeat.
+- **Stop the CelebA-HQ line.** It has answered what it was picked to answer. Another run here
+  moves 0.5325 to maybe 0.528 and produces slightly nicer faces, which is a better number
+  rather than a new finding.
+- If there is a run 7, make it **Flickr30k** (`nlphuji/flickr30k`, 31,014 images, 5 captions
+  each). Image count is roughly held fixed against CelebA-HQ's 30,000, so it isolates the one
+  variable this project has never tested: scene structure and caption ambiguity. Expect blur,
+  and correctly this time, for the reason in "What makes a dataset harder" below.
+- Cross-attention density is still the untested architecture suspect from run 5, but binding
+  works now, so there is no longer a symptom pointing at it.
+
+---
+
 ## Run 5 · 2026-09-03 · 40 epochs · generalization gap closed, attribute binding weak
 
 CelebA-HQ (`Ryan-sjtu/celebahq-caption`), 30,000 images, `base_channels=128` (60.1M params),

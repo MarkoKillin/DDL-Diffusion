@@ -1,7 +1,9 @@
 # DDL-Diffusion
 
-A latent text-to-image diffusion model built from scratch in PyTorch, trained on the Pokemon
-dataset. Every component is hand-written: noise schedule, U-Net, training loop, samplers.
+A latent text-to-image diffusion model built from scratch in PyTorch. Every component is
+hand-written: noise schedule, U-Net, training loop, samplers. Runs 1-4 trained on the Pokemon
+dataset and hit a data ceiling at 750 distinct images; runs 5-6 moved to CelebA-HQ. The current
+model is 128.9M parameters at 256×256.
 
 [`plan.md`](plan.md) has the design doc and the math derivation. The Jupyter notebook at
 [`code/diffuser.ipynb`](code/diffuser.ipynb) is the best way to step through the project. The
@@ -67,5 +69,7 @@ Deviations from `plan.md`, all deliberate:
 - **Zero-init `out_conv`**, so the network predicts exactly 0 at step 0 and the first loss is
   a clean 1.0 baseline.
 
-CFG defaults are 2.0 with `guidance_rescale=0.7`, not the SD default of 7.5. See the guidance
-sweep in `RUNS.md`, where everything above ~4 inverted the latent statistics.
+CFG defaults are 2.0 with `guidance_rescale=0.7`, well below the SD default of 7.5. Run 4 found
+that everything above ~4 inverted the latent statistics, but that was a 17.6M model on 750
+images: run 6's sweep at 128.9M holds per-sample std within +3% all the way to CFG 5.0. Treat
+the low default as a starting point, not a ceiling, and check `latent_stats` when raising it.
