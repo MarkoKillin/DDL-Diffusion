@@ -1,29 +1,12 @@
 """
-Noise schedule and forward process for diffusion. Deterministic math, no learned weights.
+Noise schedule and forward process for diffusion.
 
-Holds the precomputed schedule constants, q_sample, the prediction-target conversions and
-the loss weighting.
+zero_terminal_snr rescales the betas so alphas_cumprod[-1] is exactly 0 (Lin et al.,
+Algorithm 1). Without it x_T keeps a little x_0, and the model reads the output's brightness
+off its input instead of generating it.
 
-Two options matter:
-
-  zero_terminal_snr
-      Rescales the betas so alphas_cumprod[-1] is exactly 0 (Lin et al., "Common Diffusion
-      Noise Schedules and Sample Steps are Flawed", Algorithm 1). Without it the last
-      timestep still mixes a little x_0 into x_t, so the model can read the output's
-      brightness off its input instead of generating it. At inference x_T = randn carries
-      no such cue, and the channels collapse toward a common value.
-
-  prediction_type
-      "eps" predicts the noise: the classic DDPM parameterization, and what plan.md derives.
-      "v" predicts the velocity v = sqrt(ab) * eps - sqrt(1-ab) * x_0.
-
-      v is required when zero_terminal_snr=True. Recovering x_0 from eps needs
-      (x_t - sqrt(1-ab) eps) / sqrt(ab), which divides by zero at ab=0; the v route
-      x_0 = sqrt(ab) x_t - sqrt(1-ab) v is finite everywhere.
-
-      v also balances the loss across timesteps for free. ||v - v_hat||^2 equals
-      ||eps - eps_hat||^2 / alphas_cumprod, and the Bayes-optimal eps loss is about
-      alphas_cumprod for unit-variance data, so v-loss is roughly flat in t.
+prediction_type "eps" predicts the noise, "v" predicts sqrt(ab)*eps - sqrt(1-ab)*x_0. v is
+required at zero terminal SNR, because getting x_0 back from eps divides by sqrt(ab).
 """
 
 import math
@@ -33,7 +16,7 @@ import torch.nn as nn
 
 
 def make_betas(T: int, beta_start: float, beta_end: float, schedule: str) -> torch.Tensor:
-    """Beta schedule in float64 — the cumprod over 1000 terms is worth the precision."""
+    """Beta schedule in float64. The cumprod over 1000 terms needs the precision."""
     if schedule == "linear":
         return torch.linspace(beta_start, beta_end, T, dtype=torch.float64)
 
@@ -42,8 +25,7 @@ def make_betas(T: int, beta_start: float, beta_end: float, schedule: str) -> tor
         return torch.linspace(beta_start ** 0.5, beta_end ** 0.5, T, dtype=torch.float64) ** 2
 
     if schedule == "cosine":
-        # Nichol & Dhariwal. Spends more of the schedule at moderate noise levels,
-        # which is where image structure is decided.
+        # Nichol & Dhariwal. More of the schedule at moderate noise.
         s = 0.008
         u = torch.arange(T + 1, dtype=torch.float64) / T
         ab = torch.cos((u + s) / (1.0 + s) * math.pi * 0.5) ** 2
@@ -55,13 +37,8 @@ def make_betas(T: int, beta_start: float, beta_end: float, schedule: str) -> tor
 
 def rescale_betas_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     """
-    Lin et al. 2023, Algorithm 1.
-
-    Shifts and scales sqrt(alphas_cumprod) so its last entry is exactly 0 and its first is
-    unchanged, leaving x_T as pure noise with no residual signal.
-
-    betas[-1] becomes 1.0 as a result. That is expected: the final forward step destroys
-    all remaining signal by construction.
+    Lin et al. 2023, Algorithm 1. Shifts and scales sqrt(alphas_cumprod) so the last entry
+    is 0 and the first is unchanged. betas[-1] becomes 1.0, which is expected.
     """
     ab = torch.cumprod(1.0 - betas, dim=0)
     sqrt_ab = ab.sqrt()
@@ -76,17 +53,12 @@ def rescale_betas_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
 
 def make_timesteps(T: int, num_steps: int, device, spacing: str = "trailing") -> torch.Tensor:
     """
-    Decreasing timestep grid of length num_steps.
+    Decreasing timestep grid of length num_steps. Both spacings start at T-1, where the
+    schedule expects the pure noise that x is initialized to.
 
-    The grid must include the highest timestep, where the schedule expects the pure noise
-    we initialize x to. Fewer steps means a coarser stride over the whole schedule, not a
-    shorter walk through its low-noise tail.
-
-      "trailing" : Lin et al.'s recommendation. round(arange(T, 0, -T/n)) - 1, so the grid
-                   starts at exactly T-1. It ends at T/n - 1 rather than 0; the samplers
-                   set alpha_bar_prev = 1 on the final step, so x still lands on x_0.
-      "linspace" : evenly spaced from T-1 down to 0. Also starts at T-1, so it avoids the
-                   "leading" bug Lin et al. describe.
+      "trailing" : round(arange(T, 0, -T/n)) - 1. Ends at T/n - 1 rather than 0; the
+                   samplers set alpha_bar_prev = 1 on the last step, so x still lands on x_0.
+      "linspace" : evenly spaced from T-1 down to 0.
     """
     if num_steps >= T:
         return torch.arange(T - 1, -1, -1, device=device)
@@ -102,11 +74,7 @@ def make_timesteps(T: int, num_steps: int, device, spacing: str = "trailing") ->
 
 
 class NoiseScheduler(nn.Module):
-    """
-    DDPM noise schedule. nn.Module so the constants can ride along via
-    register_buffer — moves with .to(device), included in state_dict,
-    invisible to the optimizer.
-    """
+    """DDPM noise schedule. nn.Module so register_buffer moves the constants with .to()."""
 
     def __init__(
         self,
@@ -139,8 +107,7 @@ class NoiseScheduler(nn.Module):
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
-        # Pre-compute the square roots used in q_sample so the hot path is
-        # just two index-and-multiply ops at train time.
+        # Pre-computed so q_sample is two index-and-multiply ops.
         for name, buf in [
             ("betas", betas),
             ("alphas", alphas),
@@ -159,13 +126,9 @@ class NoiseScheduler(nn.Module):
 
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """
-        Forward diffusion in one shot:
-            x_t = sqrt(alpha_bar_t) * x_0  +  sqrt(1 - alpha_bar_t) * noise
+        x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
 
-        Shapes:
-            x_0   : (B, C, H, W)
-            t     : (B,)   long tensor of per-sample timesteps
-            noise : same shape as x_0, sampled from N(0, I)
+        x_0 is (B, C, H, W), t is (B,) long, noise matches x_0 and comes from N(0, I).
         """
         a, b = self._ab_terms(t)
         return a * x_0 + b * noise
@@ -184,13 +147,13 @@ class NoiseScheduler(nn.Module):
     # Prediction conversions
     def to_x0_and_eps(self, model_out: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor):
         """
-        Turn whatever the model predicted into (x_0_hat, eps_hat).
+        Whatever the model predicted, turned into (x_0_hat, eps_hat).
 
-        (x_t, v) -> (x_0, eps) is an exact rotation, so no division is involved:
             x_0 = sqrt(ab) * x_t - sqrt(1-ab) * v
             eps = sqrt(1-ab) * x_t + sqrt(ab) * v
-        The eps route needs a divide by sqrt(ab), which is why it cannot be paired
-        with zero_terminal_snr.
+
+        That pair is a rotation, so nothing divides. The eps route divides by sqrt(ab),
+        which is why it cannot pair with zero_terminal_snr.
         """
         a, b = self._ab_terms(t)
         if self.prediction_type == "eps":
@@ -205,20 +168,15 @@ class NoiseScheduler(nn.Module):
 
     def loss_weight(self, t: torch.Tensor, min_snr_gamma: float | None = None) -> torch.Tensor:
         """
-        Per-sample loss weight, shaped (B,). None (the default) means unweighted.
+        Per-sample weight, shaped (B,). None means unweighted, which is what v wants: at the
+        Bayes optimum v-loss is 1.0 at every t. Unweighted eps-loss equals alpha_bar_t
+        instead, which crowds the signal into low noise.
 
-        For prediction_type="v" unweighted is already the balanced objective: at the Bayes
-        optimum the v-loss is 1.0 at every t, so the signal is spread evenly across
-        timesteps. Unweighted eps-loss instead equals alpha_bar_t, which concentrates it
-        at low noise.
-
-        min_snr_gamma applies Min-SNR-gamma (Hang et al. 2023):
+        min_snr_gamma (Hang et al. 2023) is the fix for eps:
             eps : min(SNR, gamma) / SNR
             v   : min(SNR, gamma) / (SNR + 1)
-        It is the right tool for eps-prediction. On top of v it peaks where SNR = gamma
-        (alpha_bar = gamma/(1+gamma), so t~116 for gamma=5 here) and decays in both
-        directions, putting the emphasis back on low noise. Leave it None for v; it is
-        here for experiments.
+        On v it peaks at t~116 for gamma=5 and pulls the emphasis back to low noise, so leave
+        it None. It is here for experiments.
         """
         if min_snr_gamma is None:
             return torch.ones_like(self.alphas_cumprod[t])

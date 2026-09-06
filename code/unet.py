@@ -1,45 +1,5 @@
-"""
-U-Net for latent diffusion.
-
-Predicts the diffusion target (eps or v, see scheduler.prediction_type) given a
-noisy latent, its timestep, and a text embedding. Same shape in, same shape out:
-(B, 4, H, W) -> (B, 4, H, W).
-
-Components (bottom-up):
-  - sinusoidal_embedding / TimeEmbedding : encode integer t as a vector
-  - ResNetBlock                          : conv -> conv with time injection
-  - SelfAttention                        : every spatial position attends to every other
-  - CrossAttention                       : image queries text — how prompts steer generation
-  - Downsample / Upsample                : strided conv / NN-interp + conv
-  - Stage                                : ResNet(s) + SelfAttn + CrossAttn group
-  - UNet                                 : full assembly with skip connections
-
-Constructor options:
-
-  top_self_attn=False
-      Self-attention attends over H*W tokens — 4096 at 64x64 against 1024 at 32x32 and 256
-      at 16x16 — so at the highest resolution it was 44% of the forward pass. Stable
-      Diffusion has none there either. Cross-attention stays: under 1% of the cost, and it
-      is how text reaches full resolution.
-
-  num_res_blocks=2
-      DDPM and SD use 2 or more. One block per stage leaves the skip connections dominating
-      and gives the network little depth to compute with.
-
-  view_dim
-      SDXL-style micro-conditioning on the crop box and flip flag. With several augmented
-      views per image the caption does not say which framing is wanted, so part of the
-      target is unpredictable and an L2-trained model answers by predicting the average of
-      the views — which decodes as blur. Passing the view makes the mapping single-valued;
-      at inference you request the canonical view. The projection is zero-initialised, so a
-      fresh model behaves as if the conditioning were absent.
-
-  time_scale_shift=True
-      FiLM-style conditioning (ADM / SD): scale and shift the normalized activations
-      instead of adding a bias before GroupNorm, which normalizes part of the bias away.
-      Set False for the additive path — the shape of ResNetBlock.time_proj differs, so old
-      checkpoints need it.
-"""
+"""U-Net for latent diffusion. Predicts the diffusion target given a noisy latent, its timestep, and a text embedding.
+Same shape in, same shape out: (B, 4, H, W) -> (B, 4, H, W)."""
 
 import math
 
@@ -57,11 +17,7 @@ def _group_norm(channels: int, groups: int = 8) -> nn.GroupNorm:
 
 # Time embedding
 def _sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """
-    Transformer-style positional encoding adapted for timesteps.
-    Input  t : shape (B,), integer
-    Output   : shape (B, dim), float
-    """
+    """Transformer positional encoding, applied to timesteps. (B,) integer -> (B, dim) float."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
@@ -72,7 +28,6 @@ def _sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 class TimeEmbedding(nn.Module):
     """Sinusoidal encoding -> 2-layer MLP. Output dim is 4 * input dim by convention."""
-
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -91,15 +46,8 @@ class TimeEmbedding(nn.Module):
 class ResNetBlock(nn.Module):
     """
     GroupNorm -> SiLU -> Conv -> GroupNorm -> (time scale/shift) -> SiLU -> Dropout -> Conv -> + skip
-
-    GroupNorm (not BatchNorm) because diffusion uses tiny batches and GroupNorm
-    is per-sample. Skip uses 1x1 conv when channels change, identity otherwise.
-
-    time_scale_shift=True applies FiLM after norm2: h = norm2(h) * (1 + scale) + shift.
-    time_scale_shift=False adds the projected time embedding as a bias before norm2, which
-    is what DDPM does — simpler, but GroupNorm removes part of it.
+    GroupNorm rather than BatchNorm because diffusion uses tiny batches.
     """
-
     def __init__(
         self,
         in_channels: int,
@@ -123,7 +71,6 @@ class ResNetBlock(nn.Module):
         self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
 
         if time_scale_shift:
-            # Start as the identity transform so training begins from a clean residual block.
             nn.init.zeros_(self.time_proj.weight)
             nn.init.zeros_(self.time_proj.bias)
 
@@ -151,15 +98,14 @@ class ResNetBlock(nn.Module):
 # Attention
 class SelfAttention(nn.Module):
     """
-    Each spatial position attends to every other spatial position.
-    Multi-head, with head_dim=32 -> num_heads = channels // 32.
-
-    Cost is O(H*W * H*W * C), so this is affordable only at low resolution.
+    Each spatial position attends to every other. head_dim=32, so num_heads = channels // 32.
+    Cost is O(H*W * H*W * C), affordable only at low resolution.
     """
 
     def __init__(self, channels: int, head_dim: int = 32):
         super().__init__()
-        assert channels % head_dim == 0, f"channels ({channels}) must be divisible by head_dim ({head_dim})"
+        if channels % head_dim != 0:
+            raise ValueError(f"channels ({channels}) must be divisible by head_dim ({head_dim})")
         self.channels = channels
         self.num_heads = channels // head_dim
         self.head_dim = head_dim
@@ -195,15 +141,13 @@ class SelfAttention(nn.Module):
 class CrossAttention(nn.Module):
     """
     Q from image features, K and V from text embeddings (B, 77, 768). This is how text
-    controls the generated image.
-
-    Cost is O(H*W * 77 * C) — cheap even at full resolution, because the text sequence is
-    short. Keep it everywhere self-attention gets dropped.
+    controls the image.
     """
 
     def __init__(self, channels: int, context_dim: int = 768, head_dim: int = 32):
         super().__init__()
-        assert channels % head_dim == 0, f"channels ({channels}) must be divisible by head_dim ({head_dim})"
+        if channels % head_dim != 0:
+            raise ValueError(f"channels ({channels}) must be divisible by head_dim ({head_dim})")
         self.channels = channels
         self.num_heads = channels // head_dim
         self.head_dim = head_dim
@@ -243,8 +187,6 @@ class CrossAttention(nn.Module):
 
 # Resampling
 class Downsample(nn.Module):
-    """Strided 3x3 conv. Learned downsample is better than MaxPool."""
-
     def __init__(self, channels: int):
         super().__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
@@ -254,8 +196,6 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    """Nearest-neighbor upsample + 3x3 conv. Avoids ConvTranspose checkerboard artifacts."""
-
     def __init__(self, channels: int):
         super().__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
@@ -267,16 +207,7 @@ class Upsample(nn.Module):
 
 # Stages
 class Stage(nn.Module):
-    """
-    num_res_blocks x ResNet -> [SelfAttn] -> CrossAttn.
-
-    The channel change happens in the first ResNet; the rest are out_ch -> out_ch.
-    Used for both the encoder and the decoder — an UpStage just receives an in_ch
-    that already includes the concatenated skip channels.
-
-    Keeps one skip per stage regardless of num_res_blocks, rather than DDPM's one per
-    block. Less standard, but it keeps the assembly below readable.
-    """
+    """num_res_blocks x ResNet -> [SelfAttn] -> CrossAttn."""
 
     def __init__(
         self,
@@ -312,19 +243,10 @@ class Stage(nn.Module):
 # Full U-Net
 class UNet(nn.Module):
     """
-    Latent diffusion U-Net.
-
-    Encoder: 3 stages at channel widths (c1, c2, c3) = (base, 2*base, 4*base),
-             each followed by a 2x downsample. Skips saved after init_conv and
-             after each stage.
-    Bottleneck: ResNet -> SelfAttn -> CrossAttn -> ResNet at the deepest level.
-    Decoder: mirror of the encoder; each stage concatenates the matching skip
-             along the channel dim before its ResNets.
-
-    Fully resolution-agnostic — the same weights work on 32x32 or 64x64 latents.
-    Only the samplers need to know the spatial size.
+    Encoder: 3 stages at widths (base, 2*base, 4*base), each followed by a 2x downsample.
+    Bottleneck: ResNet -> SelfAttn -> CrossAttn -> ResNet.
+    Decoder: mirror of the encoder, concatenating the matching skip before each stage.
     """
-
     def __init__(
         self,
         in_channels: int = 4,
@@ -344,9 +266,6 @@ class UNet(nn.Module):
         self.time_embedding = TimeEmbedding(time_dim)
         t_emb_dim = self.time_embedding.out_dim
 
-        # Micro-conditioning on the augmentation view, added to the time embedding — the
-        # usual place for global scalar conditioning. Zero-init output, so an untrained
-        # model behaves as if view_dim=0.
         self.view_dim = view_dim
         if view_dim > 0:
             self.view_embed = nn.Sequential(
@@ -366,8 +285,7 @@ class UNet(nn.Module):
             dropout=dropout, time_scale_shift=time_scale_shift,
         )
 
-        # Encoder. Stage 1 runs at full latent resolution, where self-attention is the
-        # most expensive thing in the network — hence the flag.
+        # Encoder
         self.down1 = Stage(c1, c1, use_self_attn=top_self_attn, **stage_kwargs)
         self.down1_sample = Downsample(c1)
 
@@ -396,8 +314,7 @@ class UNet(nn.Module):
         self.out_norm = _group_norm(c1 + c1)
         self.out_conv = nn.Conv2d(c1 + c1, out_channels, kernel_size=3, padding=1)
 
-        # Zero-init the output: the network starts by predicting exactly 0, so the first
-        # loss is the predict-zero baseline and training only learns a correction.
+        # Zero-init, so the network predicts exactly 0 at step 0 and the first loss is the predict-zero baseline.
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 
@@ -421,7 +338,7 @@ class UNet(nn.Module):
                 view = torch.zeros(x.shape[0], self.view_dim, device=x.device, dtype=t_emb.dtype)
             t_emb = t_emb + self.view_embed(view.to(t_emb.dtype))
 
-        # Encoder.
+        # Encoder
         h = self.init_conv(x)
         skip_0 = h
 
@@ -434,13 +351,13 @@ class UNet(nn.Module):
         h = self.down3(h, t_emb, context); skip_3 = h
         h = self.down3_sample(h)
 
-        # Bottleneck.
+        # Bottleneck
         h = self.mid_res1(h, t_emb)
         h = self.mid_self_attn(h)
         h = self.mid_cross_attn(h, context)
         h = self.mid_res2(h, t_emb)
 
-        # Decoder.
+        # Decoder
         h = self.up3_sample(h)
         h = torch.cat([h, skip_3], dim=1)
         h = self.up3(h, t_emb, context)

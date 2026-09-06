@@ -1,27 +1,11 @@
 """
 Inference samplers for the latent diffusion U-Net.
-
 DDPM = the slow, faithful sampler from the original paper. 1000 steps.
 DDIM = the fast deterministic sampler. ~50 steps, same trained model.
 
 Both use Classifier-Free Guidance: each step batches the conditional and
 unconditional predictions through one forward pass, then combines them as
     pred = pred_uncond + w * (pred_cond - pred_uncond)
-The model itself is unchanged — CFG lives entirely in the sampler.
-
-Three things to know:
-
-  Both samplers go through scheduler.to_x0_and_eps(), so they work with
-  prediction_type="eps" or "v" without knowing which.
-
-  DDPM is written in x_0-posterior form rather than the eps shortcut. The eps form computes
-  mean = (1/sqrt(alpha_eff)) * (...), which divides by zero on the first step when
-  zero_terminal_snr makes alphas_cumprod[t] = 0. The posterior form is finite everywhere
-  and algebraically identical on the full 1000-step grid.
-
-  guidance_rescale (Lin et al. section 3.4) counteracts high guidance inflating the latent
-  standard deviation and distorting the per-channel mean pattern, by rescaling the guided
-  prediction back to the conditional prediction's standard deviation.
 """
 
 from __future__ import annotations
@@ -57,18 +41,6 @@ def _predict_with_cfg(
     guidance_rescale: float = 0.0,
     view: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    One forward pass that batches uncond + cond together, then combines.
-
-    Shapes:
-        x_t        : (B, 4, H, W)
-        t          : (B,)
-        cond_emb   : (B, 77, 768)
-        uncond_emb : (B, 77, 768)   already broadcast to batch size B
-
-    Returns the combined model prediction (B, 4, H, W) — eps or v, whichever the
-    model was trained on.
-    """
     x_in = torch.cat([x_t, x_t], dim=0)
     t_in = torch.cat([t, t], dim=0)
     ctx_in = torch.cat([uncond_emb, cond_emb], dim=0)
@@ -84,12 +56,7 @@ def _predict_with_cfg(
 
 
 def _init_latents(B, latent_shape, device, generator, x_T=None):
-    """
-    Starting noise. Pass x_T to control it explicitly.
-
-    Comparing prompts means holding the starting noise fixed across rows; otherwise the
-    difference between two samples is mostly the noise draw.
-    """
+    """Starting noise. Pass x_T to control it explicitly."""
     if x_T is not None:
         expected = (B, *latent_shape)
         if tuple(x_T.shape) != expected:
@@ -127,28 +94,9 @@ def sample_ddpm(
         x_prev    = mean + sqrt(var) * z
 
     This is the true posterior q(x_prev | x_t, x_0) with x_0 replaced by the model's
-    estimate. Written with alpha_bar ratios so a strided grid is handled correctly, and
-    in x_0 form so alpha_bar_t = 0 (zero terminal SNR) is finite. On the final step
+    estimate. Written with alpha_bar ratios so it handles a strided grid, and in x_0 form
+    so alpha_bar_t = 0 (zero terminal SNR) stays finite. On the final step
     alpha_bar_prev = 1, which reduces the mean to x0_pred and the variance to 0.
-
-    Args:
-        model            : the U-Net (typically the EMA model in eval mode)
-        scheduler        : NoiseScheduler, holds the schedule buffers and prediction_type
-        cond_emb         : (B, 77, 768) text embeddings per sample
-        uncond_emb       : (1, 77, 768) or (B, 77, 768) empty-string embedding
-        guidance_scale   : w in CFG. See guidance_rescale; 2.0 is a sane default for a
-                           small model on a small dataset, not the SD default of 7.5.
-        guidance_rescale : phi in Lin et al. section 3.4. 0.0 disables.
-        num_steps        : denoising steps; defaults to scheduler.T (the full 1000).
-        latent_shape     : (C, H, W) of the latents — must match what was trained on.
-        clip_x0          : if set, clamp each x_0 estimate to [-clip_x0, clip_x0]. Cheap
-                           guard against high guidance running away. Take it from the
-                           training latents' actual range.
-        generator        : torch.Generator for reproducible sampling
-
-    Returns:
-        (B, C, H, W) latents in the same normalized space the model trained on.
-        Pass through latents_to_images (with the saved lat_mean / lat_std) to decode.
     """
     model.eval()
     B = cond_emb.shape[0]
@@ -228,10 +176,6 @@ def sample_ddim(
     The deterministic eta=0 trajectory tends to drift toward the conditional mean, where
     DDPM-1000 tracks the data more closely. If DDIM samples look flat, try eta=1.0 before
     assuming the model is at fault.
-
-    Args as sample_ddpm, plus:
-        num_steps : how many denoising steps (typically 25-100)
-        eta       : 0.0 = deterministic DDIM, 1.0 = stochastic (DDPM-like)
     """
     model.eval()
     B = cond_emb.shape[0]
@@ -292,7 +236,7 @@ def latents_to_images(
         vae      : a diffusers AutoencoderKL in eval mode
         lat_mean : (1, C, 1, 1) per-channel mean saved by precompute.py, or None
         lat_std  : (1, C, 1, 1) per-channel std saved by precompute.py, or None
-        scale    : the 0.18215 SD scaling factor — we divide before decoding.
+        scale    : the 0.18215 SD scaling factor, divided out before decoding.
 
     If lat_mean / lat_std are given, the per-channel normalization is undone first.
     Skipping them on normalized latents decodes grey mush.
